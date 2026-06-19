@@ -267,26 +267,30 @@ else:
     if not is_below_high:
         decline_color = "#00cc88"
         decline_bg = "rgba(0, 200, 136, 0.08)"
-        decline_sign = "▲ 高値圏"
         decline_str = f"+{decline_pct:.1f}%"
+        decline_caption = "▲ 高値圏（下落なし）"
     else:
+        # Heat ramp: deeper decline → hotter color (buy zone is near)
         if decline_pct >= 20:
-            decline_color = "#ff3c3c"
-            decline_bg = "rgba(255, 60, 60, 0.1)"
+            decline_color = "#ff3b30"  # red
+            decline_bg = "rgba(255, 59, 48, 0.12)"
+            zone_label = "全力買うゾーン"
         elif decline_pct >= 10:
-            decline_color = "#ffb400"
-            decline_bg = "rgba(255, 180, 0, 0.08)"
+            decline_color = "#ff8c1a"  # deep orange
+            decline_bg = "rgba(255, 140, 26, 0.10)"
+            zone_label = "半分買うゾーン"
         else:
-            decline_color = "#aaaaaa"
-            decline_bg = "rgba(255,255,255,0.04)"
-        decline_sign = "▼ 高値から"
+            decline_color = "#ffcc33"  # yellow-orange
+            decline_bg = "rgba(255, 204, 51, 0.08)"
+            zone_label = "まだ静観"
         decline_str = f"{decline_pct:.1f}%"
+        decline_caption = f"▼ 高値から下落中 · {zone_label}"
 
     st.markdown(
         f"""
-        <div class="decline-block" style="background:{decline_bg}; border: 1.5px solid {decline_color}22;">
+        <div class="decline-block" style="background:{decline_bg}; border: 1.5px solid {decline_color}55;">
             <div class="decline-pct" style="color:{decline_color};">{decline_str}</div>
-            <div class="decline-label">{decline_sign}下落中</div>
+            <div class="decline-label" style="color:{decline_color}; opacity:0.95; font-weight:600;">{decline_caption}</div>
             {today_html}
         </div>
         """,
