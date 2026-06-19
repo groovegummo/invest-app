@@ -156,11 +156,32 @@ period_months = st.slider(
 with st.spinner("データ取得中..."):
     df = fetch_data(ticker, period_months)
 
-if df.empty or "Close" not in df.columns:
-    st.error("データの取得に失敗しました。しばらく待ってから再試行してください。")
-    st.stop()
+# Build a clean Close series. yfinance can return a trailing NaN row for the
+# current (still-forming) session; dropna() prevents NaN current_price/decline.
+close = pd.Series(dtype="float64")
+if not df.empty and "Close" in df.columns:
+    close = df["Close"].squeeze()
+    if not isinstance(close, pd.Series):  # single-row frame squeezes to scalar
+        close = pd.Series([close], index=[df.index[-1]])
+    close = close.dropna()
 
-close = df["Close"].squeeze()
+# ── No usable data ───────────────────────────────────
+if close.empty:
+    if watch_mode:
+        st.markdown(
+            f"""
+            <div class="decline-block" style="background:rgba(255,255,255,0.04); border: 1.5px solid rgba(255,255,255,0.15);">
+                <div class="decline-label" style="opacity:0.6;">👀 ウォッチ中</div>
+                <div class="decline-pct" style="color:#888; font-size:2.2rem;">— —</div>
+                <div class="decline-label">データ取得不可（{ticker}）</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.caption("この銘柄は現在 yfinance から価格データを取得できません。時間をおいて再度お試しください。")
+    else:
+        st.error("データの取得に失敗しました。しばらく待ってから再試行してください。")
+    st.stop()
 
 # ── Common calculations ──────────────────────────────
 current_price = float(close.iloc[-1])
