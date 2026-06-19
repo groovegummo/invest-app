@@ -88,6 +88,13 @@ INDICES = {
     "NASDAQ 100  (^NDX)": "^NDX",
 }
 
+# Watch-only tickers: chart + price only, no dip judgment
+WATCH = {
+    "SpaceX (SPCX)": "SPCX",
+}
+
+ALL_OPTIONS = {**INDICES, **WATCH}
+
 
 @st.cache_data(ttl=300)
 def fetch_data(ticker: str, months: int) -> pd.DataFrame:
@@ -131,12 +138,13 @@ def get_judgment(decline_pct: float, funds: float) -> dict:
 st.title("📉 Dip Buy Guide")
 
 # ── Index selector ──────────────────────────────────
-selected_label = st.radio("指数", list(INDICES.keys()), horizontal=True)
-ticker = INDICES[selected_label]
+selected_label = st.radio("銘柄", list(ALL_OPTIONS.keys()), horizontal=True)
+ticker = ALL_OPTIONS[selected_label]
+watch_mode = selected_label in WATCH
 
 # ── Period slider ────────────────────────────────────
 period_months = st.slider(
-    "高値を測る期間",
+    "表示期間" if watch_mode else "高値を測る期間",
     min_value=3,
     max_value=36,
     value=12,
@@ -154,36 +162,13 @@ if df.empty or "Close" not in df.columns:
 
 close = df["Close"].squeeze()
 
-# ── Calculations ─────────────────────────────────────
-recent_high = float(close.max())
-recent_high_date = close.idxmax()
+# ── Common calculations ──────────────────────────────
 current_price = float(close.iloc[-1])
 current_date = close.index[-1]
-decline_pct = abs((current_price - recent_high) / recent_high * 100)
-is_below_high = current_price < recent_high
 
 # Today's change vs previous close
 prev_close = float(close.iloc[-2]) if len(close) >= 2 else current_price
 today_change_pct = (current_price - prev_close) / prev_close * 100
-
-# ── Decline display ───────────────────────────────────
-if not is_below_high:
-    decline_color = "#00cc88"
-    decline_bg = "rgba(0, 200, 136, 0.08)"
-    decline_sign = "▲ 高値圏"
-    decline_str = f"+{decline_pct:.1f}%"
-else:
-    if decline_pct >= 20:
-        decline_color = "#ff3c3c"
-        decline_bg = "rgba(255, 60, 60, 0.1)"
-    elif decline_pct >= 10:
-        decline_color = "#ffb400"
-        decline_bg = "rgba(255, 180, 0, 0.08)"
-    else:
-        decline_color = "#aaaaaa"
-        decline_bg = "rgba(255,255,255,0.04)"
-    decline_sign = "▼ 高値から"
-    decline_str = f"{decline_pct:.1f}%"
 
 today_color = "#00cc88" if today_change_pct >= 0 else "#ff3c3c"
 today_sign = "+" if today_change_pct >= 0 else ""
@@ -192,16 +177,55 @@ today_html = (
     f'今日: {today_sign}{today_change_pct:.1f}%</div>'
 )
 
-st.markdown(
-    f"""
-    <div class="decline-block" style="background:{decline_bg}; border: 1.5px solid {decline_color}22;">
-        <div class="decline-pct" style="color:{decline_color};">{decline_str}</div>
-        <div class="decline-label">{decline_sign}下落中</div>
-        {today_html}
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+# ── Main display ─────────────────────────────────────
+if watch_mode:
+    # Watch mode: show current price + today's change only
+    st.markdown(
+        f"""
+        <div class="decline-block" style="background:rgba(91,156,246,0.08); border: 1.5px solid rgba(91,156,246,0.25);">
+            <div class="decline-label" style="opacity:0.6;">👀 ウォッチ中</div>
+            <div class="decline-pct" style="color:#5b9cf6; font-size:3rem;">{current_price:,.1f}</div>
+            <div class="decline-label">現在値</div>
+            {today_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+else:
+    # Dip mode: compute decline from recent high
+    recent_high = float(close.max())
+    recent_high_date = close.idxmax()
+    decline_pct = abs((current_price - recent_high) / recent_high * 100)
+    is_below_high = current_price < recent_high
+
+    if not is_below_high:
+        decline_color = "#00cc88"
+        decline_bg = "rgba(0, 200, 136, 0.08)"
+        decline_sign = "▲ 高値圏"
+        decline_str = f"+{decline_pct:.1f}%"
+    else:
+        if decline_pct >= 20:
+            decline_color = "#ff3c3c"
+            decline_bg = "rgba(255, 60, 60, 0.1)"
+        elif decline_pct >= 10:
+            decline_color = "#ffb400"
+            decline_bg = "rgba(255, 180, 0, 0.08)"
+        else:
+            decline_color = "#aaaaaa"
+            decline_bg = "rgba(255,255,255,0.04)"
+        decline_sign = "▼ 高値から"
+        decline_str = f"{decline_pct:.1f}%"
+
+    st.markdown(
+        f"""
+        <div class="decline-block" style="background:{decline_bg}; border: 1.5px solid {decline_color}22;">
+            <div class="decline-pct" style="color:{decline_color};">{decline_str}</div>
+            <div class="decline-label">{decline_sign}下落中</div>
+            {today_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 # ── Chart ─────────────────────────────────────────────
 fig = go.Figure()
@@ -215,18 +239,19 @@ fig.add_trace(go.Scatter(
     hovertemplate="%{x|%Y/%m/%d}<br>%{y:,.0f}<extra></extra>",
 ))
 
-# High marker
-fig.add_trace(go.Scatter(
-    x=[recent_high_date],
-    y=[recent_high],
-    mode="markers+text",
-    marker=dict(color="#ffb400", size=10, symbol="triangle-up"),
-    text=[f"  高値 {recent_high:,.0f}"],
-    textposition="top right",
-    textfont=dict(color="#ffb400", size=11),
-    name="直近高値",
-    hovertemplate="%{x|%Y/%m/%d}<br>%{y:,.0f}<extra>直近高値</extra>",
-))
+# High marker (dip mode only)
+if not watch_mode:
+    fig.add_trace(go.Scatter(
+        x=[recent_high_date],
+        y=[recent_high],
+        mode="markers+text",
+        marker=dict(color="#ffb400", size=10, symbol="triangle-up"),
+        text=[f"  高値 {recent_high:,.0f}"],
+        textposition="top right",
+        textfont=dict(color="#ffb400", size=11),
+        name="直近高値",
+        hovertemplate="%{x|%Y/%m/%d}<br>%{y:,.0f}<extra>直近高値</extra>",
+    ))
 
 # Current price line
 fig.add_hline(
@@ -252,54 +277,73 @@ fig.update_layout(
 
 st.plotly_chart(fig, use_container_width=True)
 
-# ── Funds input ───────────────────────────────────────
-st.markdown("#### 待機資金")
-if "waiting_funds" not in st.session_state:
-    st.session_state.waiting_funds = 1_000_000
+cur_date_str = current_date.strftime("%Y/%m/%d") if hasattr(current_date, "strftime") else str(current_date)
 
-waiting_funds = st.number_input(
-    "合計額（円）",
-    min_value=0,
-    value=st.session_state.waiting_funds,
-    step=100_000,
-    format="%d",
-    key="waiting_funds",
-)
+if watch_mode:
+    # ── Watch mode: info only, no judgment ───────────
+    st.info("👀 ウォッチ専用銘柄です。ディップ判定（買い増し目安）は表示しません。")
 
-# ── Judgment ─────────────────────────────────────────
-judgment = get_judgment(decline_pct if is_below_high else 0, waiting_funds)
+    with st.expander("詳細", expanded=True):
+        rows = [
+            ("現在値", f"{current_price:,.2f}　({cur_date_str})"),
+            ("前日比", f"{today_sign}{today_change_pct:.2f}%"),
+            ("表示期間", f"過去{period_months}ヶ月"),
+        ]
+        rows_html = "\n".join(
+            f"<tr><td>{label}</td><td>{value}</td></tr>" for label, value in rows
+        )
+        st.markdown(
+            f'<table class="info-table"><tbody>{rows_html}</tbody></table>',
+            unsafe_allow_html=True,
+        )
+else:
+    # ── Funds input ──────────────────────────────────
+    st.markdown("#### 待機資金")
+    if "waiting_funds" not in st.session_state:
+        st.session_state.waiting_funds = 1_000_000
 
-amount_html = ""
-if judgment["amount"] > 0:
-    amount_html = f'<div class="judgment-amount">¥{judgment["amount"]:,.0f}</div>'
-
-st.markdown(
-    f"""
-    <div class="judgment-block" style="background:{judgment['bg']}; border: 1.5px solid {judgment['border']}44;">
-        <div class="judgment-text">{judgment['level']}</div>
-        <div style="opacity:0.75; font-size:0.9rem; margin-top:0.4rem;">{judgment['detail']}</div>
-        {amount_html}
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-# ── Data summary ──────────────────────────────────────
-with st.expander("判定の根拠", expanded=True):
-    high_date_str = recent_high_date.strftime("%Y/%m/%d") if hasattr(recent_high_date, "strftime") else str(recent_high_date)
-    cur_date_str = current_date.strftime("%Y/%m/%d") if hasattr(current_date, "strftime") else str(current_date)
-    rows = [
-        ("直近高値", f"{recent_high:,.0f}　({high_date_str})"),
-        ("現在値", f"{current_price:,.0f}　({cur_date_str})"),
-        ("下落率", f"{decline_pct:.2f}%" if is_below_high else "高値圏（下落なし）"),
-        ("前日比", f"{today_sign}{today_change_pct:.2f}%"),
-        ("測定期間", f"過去{period_months}ヶ月"),
-        ("待機資金", f"¥{waiting_funds:,.0f}"),
-    ]
-    rows_html = "\n".join(
-        f"<tr><td>{label}</td><td>{value}</td></tr>" for label, value in rows
+    waiting_funds = st.number_input(
+        "合計額（円）",
+        min_value=0,
+        value=st.session_state.waiting_funds,
+        step=100_000,
+        format="%d",
+        key="waiting_funds",
     )
+
+    # ── Judgment ─────────────────────────────────────
+    judgment = get_judgment(decline_pct if is_below_high else 0, waiting_funds)
+
+    amount_html = ""
+    if judgment["amount"] > 0:
+        amount_html = f'<div class="judgment-amount">¥{judgment["amount"]:,.0f}</div>'
+
     st.markdown(
-        f'<table class="info-table"><tbody>{rows_html}</tbody></table>',
+        f"""
+        <div class="judgment-block" style="background:{judgment['bg']}; border: 1.5px solid {judgment['border']}44;">
+            <div class="judgment-text">{judgment['level']}</div>
+            <div style="opacity:0.75; font-size:0.9rem; margin-top:0.4rem;">{judgment['detail']}</div>
+            {amount_html}
+        </div>
+        """,
         unsafe_allow_html=True,
     )
+
+    # ── Data summary ─────────────────────────────────
+    with st.expander("判定の根拠", expanded=True):
+        high_date_str = recent_high_date.strftime("%Y/%m/%d") if hasattr(recent_high_date, "strftime") else str(recent_high_date)
+        rows = [
+            ("直近高値", f"{recent_high:,.0f}　({high_date_str})"),
+            ("現在値", f"{current_price:,.0f}　({cur_date_str})"),
+            ("下落率", f"{decline_pct:.2f}%" if is_below_high else "高値圏（下落なし）"),
+            ("前日比", f"{today_sign}{today_change_pct:.2f}%"),
+            ("測定期間", f"過去{period_months}ヶ月"),
+            ("待機資金", f"¥{waiting_funds:,.0f}"),
+        ]
+        rows_html = "\n".join(
+            f"<tr><td>{label}</td><td>{value}</td></tr>" for label, value in rows
+        )
+        st.markdown(
+            f'<table class="info-table"><tbody>{rows_html}</tbody></table>',
+            unsafe_allow_html=True,
+        )
