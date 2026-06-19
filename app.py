@@ -107,6 +107,33 @@ def fetch_data(ticker: str, months: int) -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=60)
+def fetch_quote(ticker: str) -> dict:
+    """Real-time-ish quote via fast_info. Daily download lags by a session or
+    more, so this gives the live last price and the true previous close."""
+    result = {"last_price": None, "prev_close": None}
+    try:
+        fi = yf.Ticker(ticker).fast_info
+        for key in ("last_price",):
+            try:
+                v = fi[key]
+                if v is not None and v == v:  # not NaN
+                    result["last_price"] = float(v)
+            except Exception:
+                pass
+        for key in ("previous_close", "regular_market_previous_close"):
+            try:
+                v = fi[key]
+                if v is not None and v == v:
+                    result["prev_close"] = float(v)
+                    break
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return result
+
+
 def get_judgment(decline_pct: float, funds: float) -> dict:
     if decline_pct >= 20:
         return {
@@ -184,12 +211,30 @@ if close.empty:
     st.stop()
 
 # ── Common calculations ──────────────────────────────
-current_price = float(close.iloc[-1])
-current_date = close.index[-1]
+# Daily download lags (its last bar can be a session or more old), so prefer
+# the live fast_info quote for current price and the true previous close.
+quote = fetch_quote(ticker)
+hist_last = float(close.iloc[-1])
+current_price = quote["last_price"] if quote["last_price"] is not None else hist_last
 
-# Today's change vs previous close
-prev_close = float(close.iloc[-2]) if len(close) >= 2 else current_price
-today_change_pct = (current_price - prev_close) / prev_close * 100
+if quote["prev_close"] is not None:
+    prev_close = quote["prev_close"]
+elif len(close) >= 2:
+    prev_close = float(close.iloc[-2])
+else:
+    prev_close = current_price
+
+today_change_pct = (current_price - prev_close) / prev_close * 100 if prev_close else 0.0
+
+# Reflect the live price on the chart series so the tip and the recent-high
+# calculation match the real market instead of a stale daily bar.
+last_date = close.index[-1]
+is_today = hasattr(last_date, "date") and last_date.date() == datetime.now().date()
+if is_today:
+    close.iloc[-1] = current_price
+else:
+    close.loc[pd.Timestamp(datetime.now().date())] = current_price
+current_date = close.index[-1]
 
 today_color = "#00cc88" if today_change_pct >= 0 else "#ff3c3c"
 today_sign = "+" if today_change_pct >= 0 else ""
