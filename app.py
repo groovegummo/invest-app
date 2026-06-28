@@ -108,6 +108,9 @@ SECTORS = {
 
 SECTOR_PERIODS = {"1週間": 7, "1ヶ月": 30, "3ヶ月": 90, "6ヶ月": 180}
 
+# ETF proxies for news (index tickers have sparse news on yfinance)
+NEWS_TICKER_MAP = {"^GSPC": "SPY", "^NDX": "QQQ"}
+
 
 @st.cache_data(ttl=300)
 def fetch_data(ticker: str, months: int) -> pd.DataFrame:
@@ -122,15 +125,14 @@ def fetch_data(ticker: str, months: int) -> pd.DataFrame:
 
 @st.cache_data(ttl=60)
 def fetch_quote(ticker: str) -> dict:
-    """Real-time-ish quote via fast_info. Daily download lags by a session or
-    more, so this gives the live last price and the true previous close."""
+    """Real-time-ish quote via fast_info."""
     result = {"last_price": None, "prev_close": None}
     try:
         fi = yf.Ticker(ticker).fast_info
         for key in ("last_price",):
             try:
                 v = fi[key]
-                if v is not None and v == v:  # not NaN
+                if v is not None and v == v:
                     result["last_price"] = float(v)
             except Exception:
                 pass
@@ -152,7 +154,7 @@ def fetch_sector_return(ticker: str, period_days: int) -> float | None:
     """Returns percentage change over period_days. None on any failure."""
     try:
         end = datetime.now()
-        start = end - timedelta(days=period_days + 5)  # buffer for non-trading days
+        start = end - timedelta(days=period_days + 5)
         df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
@@ -162,7 +164,6 @@ def fetch_sector_return(ticker: str, period_days: int) -> float | None:
         if not isinstance(close, pd.Series):
             close = pd.Series([close], index=[df.index[-1]])
         close = close.dropna()
-        # Need at least first price (period start) and last price
         target_start = datetime.now() - timedelta(days=period_days)
         eligible = close[close.index >= pd.Timestamp(target_start.date())]
         if len(eligible) < 1 or len(close) < 2:
@@ -176,6 +177,17 @@ def fetch_sector_return(ticker: str, period_days: int) -> float | None:
         return None
 
 
+@st.cache_data(ttl=1800)
+def fetch_news(ticker: str) -> list:
+    """Latest news items from yfinance. Empty list on failure."""
+    try:
+        news_ticker = NEWS_TICKER_MAP.get(ticker, ticker)
+        items = yf.Ticker(news_ticker).news or []
+        return items
+    except Exception:
+        return []
+
+
 def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     gain = delta.clip(lower=0)
@@ -186,8 +198,91 @@ def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
+def compute_composite(
+    decline_pct: float,
+    is_below_high: bool,
+    combined_ma: pd.DataFrame,
+    golden_crosses: pd.DatetimeIndex,
+    dead_crosses: pd.DatetimeIndex,
+    sector_1m: dict,
+) -> dict:
+    """Return composite buy-signal score (0–10) and breakdown."""
+    OFFENSIVE = {"SOXX", "XLK", "XLY"}
+    DEFENSIVE = {"XLP", "XLV"}
+
+    # ── Decline score (0–5) ──────────────────────────────
+    if not is_below_high:
+        d_score = 0
+    elif decline_pct >= 20:
+        d_score = 5
+    elif decline_pct >= 15:
+        d_score = 4
+    elif decline_pct >= 10:
+        d_score = 3
+    elif decline_pct >= 5:
+        d_score = 2
+    else:
+        d_score = 1
+
+    # ── Cross score (0–3) ────────────────────────────────
+    lookback = pd.Timestamp(datetime.now().date()) - pd.Timedelta(days=30)
+    recent_gc = any(d >= lookback for d in golden_crosses)
+    recent_dc = any(d >= lookback for d in dead_crosses)
+
+    if recent_gc:
+        c_score = 3
+        c_label = "GC形成（直近30日）"
+    elif recent_dc:
+        c_score = 0
+        c_label = "DC形成（直近30日）"
+    elif len(combined_ma) >= 1 and combined_ma["s"].iloc[-1] > combined_ma["l"].iloc[-1]:
+        c_score = 2
+        c_label = "MA25 > MA75（上昇トレンド）"
+    else:
+        c_score = 1
+        c_label = "MA25 < MA75（下降トレンド）"
+
+    # ── Sector score (0–2) ───────────────────────────────
+    if sector_1m:
+        sorted_desc = sorted(sector_1m.items(), key=lambda x: x[1], reverse=True)
+        top3 = [lbl.split()[0] for lbl, _ in sorted_desc[:3]]
+        def_count = sum(1 for t in top3 if t in DEFENSIVE)
+        off_count = sum(1 for t in top3 if t in OFFENSIVE)
+        neg_ratio = sum(1 for v in sector_1m.values() if v < 0) / len(sector_1m)
+        if def_count >= 2 or neg_ratio >= 0.6:
+            s_score = 2
+            s_label = "リスクオフ（逆張り好機の傾向）"
+        elif off_count >= 2:
+            s_score = 0
+            s_label = "リスクオン（高値圏の可能性）"
+        else:
+            s_score = 1
+            s_label = "混在"
+    else:
+        s_score = 1
+        s_label = "データなし"
+
+    total = d_score + c_score + s_score
+
+    if total >= 8:
+        verdict = "3つのシグナルが揃ってきた局面の傾向です。"
+        color, bg = "#00cc88", "rgba(0,200,136,0.09)"
+    elif total >= 5:
+        verdict = "一部シグナルが出ている傾向です。慎重に判断を。"
+        color, bg = "#ffb400", "rgba(255,180,0,0.09)"
+    else:
+        verdict = "まだシグナルは弱い傾向です。様子見の局面かもしれません。"
+        color, bg = "#888888", "rgba(255,255,255,0.04)"
+
+    return {
+        "total": total, "color": color, "bg": bg, "verdict": verdict,
+        "d_score": d_score, "c_score": c_score, "s_score": s_score,
+        "c_label": c_label, "s_label": s_label,
+    }
+
+
 def market_mood(returns: dict, period_label: str) -> dict:
-    """Rule-based market mood from sector ETF returns. Returns display dict."""
+    """Rule-based market mood from sector ETF returns."""
     OFFENSIVE = {"SOXX", "XLK", "XLY"}
     DEFENSIVE = {"XLP", "XLV"}
     overheat_th = {"1週間": 5.0, "1ヶ月": 15.0, "3ヶ月": 25.0, "6ヶ月": 40.0}.get(period_label, 15.0)
@@ -204,12 +299,10 @@ def market_mood(returns: dict, period_label: str) -> dict:
     top_ticker = ticker_of(sorted_desc[0][0]) if sorted_desc else ""
     top_name = SECTORS.get(top_ticker, top_ticker)
     top_value = sorted_desc[0][1] if sorted_desc else 0.0
-
     top3_tickers = [ticker_of(label) for label, _ in sorted_desc[:3]]
     off_in_top3 = sum(1 for t in top3_tickers if t in OFFENSIVE)
     def_in_top3 = sum(1 for t in top3_tickers if t in DEFENSIVE)
 
-    # Determine mood tier
     if neg_count == total:
         icon, bg, border = "🔴", "rgba(255,60,60,0.09)", "#ff3c3c"
         text = "全セクターがマイナス圏で、地合いは全面安の傾向です。"
@@ -229,7 +322,6 @@ def market_mood(returns: dict, period_label: str) -> dict:
         icon, bg, border = "⚪", "rgba(255,255,255,0.04)", "rgba(255,255,255,0.2)"
         text = "強弱が混在しており、セクターによって方向感が分かれる地合いの傾向です。"
 
-    # Append overheat note when the top sector is notably elevated
     if top_value >= overheat_th:
         text += f"　なお{top_name}が{top_value:+.1f}%と突出した動きで、過熱感には注意が必要かもしれません。"
 
@@ -249,95 +341,62 @@ def cross_period_summary(returns_1m: dict, returns_6m: dict) -> dict | None:
 
     ranked_1m = sorted(returns_1m.items(), key=lambda x: x[1], reverse=True)
     ranked_6m = sorted(returns_6m.items(), key=lambda x: x[1], reverse=True)
-
     top3_1m = [ticker_of(lbl) for lbl, _ in ranked_1m[:3]]
     top3_6m = [ticker_of(lbl) for lbl, _ in ranked_6m[:3]]
     off_1m = sum(1 for t in top3_1m if t in OFFENSIVE)
     def_1m = sum(1 for t in top3_1m if t in DEFENSIVE)
     off_6m = sum(1 for t in top3_6m if t in OFFENSIVE)
     def_6m = sum(1 for t in top3_6m if t in DEFENSIVE)
-
     top_1m = ticker_of(ranked_1m[0][0])
     top_6m = ticker_of(ranked_6m[0][0])
     name_1m = SECTORS.get(top_1m, top_1m)
     name_6m = SECTORS.get(top_6m, top_6m)
-
     tickers_1m_list = [ticker_of(lbl) for lbl, _ in ranked_1m]
     rank_6m_in_1m = (tickers_1m_list.index(top_6m) + 1
                      if top_6m in tickers_1m_list else None)
 
-    # Case: defensive sectors newly rising in 1M vs 6M
     if def_1m > def_6m and def_1m >= 1:
-        return {
-            "icon": "⚠️",
-            "text": ("短期（1ヶ月）で守りのセクターが長期（6ヶ月）よりも上位に浮上している傾向です。"
-                     "資金が守りに回り始め、地合い悪化の初期サインかもしれません。"),
-            "bg": "rgba(255,204,51,0.07)", "border": "#ffcc33",
-        }
+        return {"icon": "⚠️",
+                "text": ("短期（1ヶ月）で守りのセクターが長期（6ヶ月）よりも上位に浮上している傾向です。"
+                         "資金が守りに回り始め、地合い悪化の初期サインかもしれません。"),
+                "bg": "rgba(255,204,51,0.07)", "border": "#ffcc33"}
 
-    # Case: offensive sectors accelerating in 1M vs 6M
     if off_1m > off_6m and off_1m >= 2:
-        return {
-            "icon": "📈",
-            "text": ("短期（1ヶ月）で攻めのセクターが長期（6ヶ月）よりも上位に浮上している傾向です。"
-                     "リスクオンが加速してきた可能性が感じられます。"),
-            "bg": "rgba(0,200,136,0.07)", "border": "#00cc88",
-        }
+        return {"icon": "📈",
+                "text": ("短期（1ヶ月）で攻めのセクターが長期（6ヶ月）よりも上位に浮上している傾向です。"
+                         "リスクオンが加速してきた可能性が感じられます。"),
+                "bg": "rgba(0,200,136,0.07)", "border": "#00cc88"}
 
-    # Case: same top sector in both periods — trend continuation
     if top_1m == top_6m:
-        return {
-            "icon": "➡️",
-            "text": (f"短期・長期ともに{name_1m}がトップの傾向で、現在の流れが継続している可能性があります。"
-                     "セクターローテーションの兆候は現時点では目立ちません。"),
-            "bg": "rgba(91,156,246,0.07)", "border": "#5b9cf6",
-        }
+        return {"icon": "➡️",
+                "text": (f"短期・長期ともに{name_1m}がトップの傾向で、現在の流れが継続している可能性があります。"
+                         "セクターローテーションの兆候は現時点では目立ちません。"),
+                "bg": "rgba(91,156,246,0.07)", "border": "#5b9cf6"}
 
-    # Case: 6M leader has slipped out of 1M top 3 — possible reversal
     if rank_6m_in_1m is not None and rank_6m_in_1m > 3:
         position = "下位" if rank_6m_in_1m > len(tickers_1m_list) // 2 else "中位"
-        return {
-            "icon": "🔄",
-            "text": (f"長期（6ヶ月）でトップだった{name_6m}が、短期（1ヶ月）では{position}に後退している傾向です。"
-                     "長期の主役が足元で失速し、潮目が変わりかけの可能性も考えられます。"),
-            "bg": "rgba(255,140,0,0.07)", "border": "#ff8c00",
-        }
+        return {"icon": "🔄",
+                "text": (f"長期（6ヶ月）でトップだった{name_6m}が、短期（1ヶ月）では{position}に後退している傾向です。"
+                         "長期の主役が足元で失速し、潮目が変わりかけの可能性も考えられます。"),
+                "bg": "rgba(255,140,0,0.07)", "border": "#ff8c00"}
 
-    # Fallback: general rotation
-    return {
-        "icon": "🔄",
-        "text": (f"長期（6ヶ月）のトップは{name_6m}でしたが、"
-                 f"短期（1ヶ月）では{name_1m}が強さを見せている傾向です。"
-                 "セクター間のローテーションが起きている可能性があります。"),
-        "bg": "rgba(255,140,0,0.07)", "border": "#ff8c00",
-    }
+    return {"icon": "🔄",
+            "text": (f"長期（6ヶ月）のトップは{name_6m}でしたが、"
+                     f"短期（1ヶ月）では{name_1m}が強さを見せている傾向です。"
+                     "セクター間のローテーションが起きている可能性があります。"),
+            "bg": "rgba(255,140,0,0.07)", "border": "#ff8c00"}
 
 
 def get_judgment(decline_pct: float, funds: float) -> dict:
     if decline_pct >= 20:
-        return {
-            "level": "🔴 全力買い局面",
-            "detail": "残りを投入する局面",
-            "amount": funds,
-            "bg": "rgba(255, 60, 60, 0.15)",
-            "border": "#ff3c3c",
-        }
+        return {"level": "🔴 全力買い局面", "detail": "残りを投入する局面",
+                "amount": funds, "bg": "rgba(255, 60, 60, 0.15)", "border": "#ff3c3c"}
     elif decline_pct >= 10:
-        return {
-            "level": "🟡 半分投入の局面",
-            "detail": "待機資金の半分を投入する局面",
-            "amount": funds * 0.5,
-            "bg": "rgba(255, 180, 0, 0.12)",
-            "border": "#ffb400",
-        }
+        return {"level": "🟡 半分投入の局面", "detail": "待機資金の半分を投入する局面",
+                "amount": funds * 0.5, "bg": "rgba(255, 180, 0, 0.12)", "border": "#ffb400"}
     else:
-        return {
-            "level": "🟢 待機",
-            "detail": "まだ様子見。高値からの下落が10%未満。",
-            "amount": 0,
-            "bg": "rgba(0, 200, 136, 0.1)",
-            "border": "#00cc88",
-        }
+        return {"level": "🟢 待機", "detail": "まだ様子見。高値からの下落が10%未満。",
+                "amount": 0, "bg": "rgba(0, 200, 136, 0.1)", "border": "#00cc88"}
 
 
 # ── Header ──────────────────────────────────────────
@@ -346,38 +405,38 @@ st.title("📉 Dip Buy Guide")
 tab1, tab2 = st.tabs(["📉 ディップ判定", "🔥 セクター比較"])
 
 # ════════════════════════════════════════════════════
-# TAB 1 — Dip judgment (existing content, unchanged)
+# TAB 1 — Dip judgment + composite score + news
 # ════════════════════════════════════════════════════
 with tab1:
-    # ── Index selector ──────────────────────────────────
+    # ── Controls ────────────────────────────────────────
     selected_label = st.radio("銘柄", list(ALL_OPTIONS.keys()), horizontal=True)
     ticker = ALL_OPTIONS[selected_label]
     watch_mode = selected_label in WATCH
 
-    # ── Period slider ────────────────────────────────────
     period_months = st.slider(
         "表示期間" if watch_mode else "高値を測る期間",
-        min_value=3,
-        max_value=36,
-        value=12,
-        step=3,
-        format="%dヶ月",
+        min_value=3, max_value=36, value=12, step=3, format="%dヶ月",
     )
 
-    # ── Fetch ────────────────────────────────────────────
+    # ── Fetch ───────────────────────────────────────────
     with st.spinner("データ取得中..."):
         df = fetch_data(ticker, period_months)
+        # 1M sector data for composite score (cached; cheap on repeat renders)
+        sector_1m: dict[str, float] = {}
+        if not watch_mode:
+            for _etf, _name in SECTORS.items():
+                _r = fetch_sector_return(_etf, 30)
+                if _r is not None:
+                    sector_1m[f"{_etf}  {_name}"] = _r
 
-    # Build a clean Close series. yfinance can return a trailing NaN row for the
-    # current (still-forming) session; dropna() prevents NaN current_price/decline.
+    # ── Build close series ──────────────────────────────
     close = pd.Series(dtype="float64")
     if not df.empty and "Close" in df.columns:
         close = df["Close"].squeeze()
-        if not isinstance(close, pd.Series):  # single-row frame squeezes to scalar
+        if not isinstance(close, pd.Series):
             close = pd.Series([close], index=[df.index[-1]])
         close = close.dropna()
 
-    # ── No usable data ───────────────────────────────────
     if close.empty:
         if watch_mode:
             st.markdown(
@@ -395,9 +454,7 @@ with tab1:
             st.error("データの取得に失敗しました。しばらく待ってから再試行してください。")
         st.stop()
 
-    # ── Common calculations ──────────────────────────────
-    # Daily download lags (its last bar can be a session or more old), so prefer
-    # the live fast_info quote for current price and the true previous close.
+    # ── Price calculations ──────────────────────────────
     quote = fetch_quote(ticker)
     hist_last = float(close.iloc[-1])
     current_price = quote["last_price"] if quote["last_price"] is not None else hist_last
@@ -411,8 +468,6 @@ with tab1:
 
     today_change_pct = (current_price - prev_close) / prev_close * 100 if prev_close else 0.0
 
-    # Reflect the live price on the chart series so the tip and the recent-high
-    # calculation match the real market instead of a stale daily bar.
     last_date = close.index[-1]
     is_today = hasattr(last_date, "date") and last_date.date() == datetime.now().date()
     if is_today:
@@ -428,9 +483,65 @@ with tab1:
         f'今日: {today_sign}{today_change_pct:.1f}%</div>'
     )
 
-    # ── Main display ─────────────────────────────────────
+    # ── Dip-specific calculations (needed for composite) ──
+    if not watch_mode:
+        recent_high = float(close.max())
+        recent_high_date = close.idxmax()
+        decline_pct = abs((current_price - recent_high) / recent_high * 100)
+        is_below_high = current_price < recent_high
+
+    # ── Technical indicators ─────────────────────────────
+    ma_short = close.rolling(25).mean()
+    ma_long = close.rolling(75).mean()
+    rsi = compute_rsi(close)
+
+    combined_ma = pd.DataFrame({"s": ma_short, "l": ma_long}).dropna()
+    if len(combined_ma) >= 2:
+        diff = combined_ma["s"] - combined_ma["l"]
+        sign_prev = diff.shift(1)
+        golden_crosses = diff.index[(sign_prev < 0) & (diff >= 0)]
+        dead_crosses = diff.index[(sign_prev > 0) & (diff <= 0)]
+    else:
+        golden_crosses = pd.DatetimeIndex([])
+        dead_crosses = pd.DatetimeIndex([])
+
+    # ── Composite score ──────────────────────────────────
+    if not watch_mode:
+        sc = compute_composite(
+            decline_pct if is_below_high else 0,
+            is_below_high,
+            combined_ma,
+            golden_crosses,
+            dead_crosses,
+            sector_1m,
+        )
+        filled = "█" * sc["total"]
+        empty = "░" * (10 - sc["total"])
+        d_str = f"{decline_pct:.1f}%" if is_below_high else "高値圏"
+        st.markdown(
+            f"""
+            <div style="padding:1.1rem 1.3rem; border-radius:14px;
+                        background:{sc['bg']}; border:1.5px solid {sc['color']}55;
+                        margin-bottom:0.5rem;">
+                <div style="display:flex; align-items:baseline; gap:0.5rem; margin-bottom:0.3rem;">
+                    <span style="font-size:0.82rem; opacity:0.6;">🎯 総合スコア</span>
+                    <span style="font-size:2.6rem; font-weight:900; color:{sc['color']}; line-height:1;">{sc['total']}</span>
+                    <span style="font-size:0.95rem; opacity:0.45;">/ 10</span>
+                </div>
+                <div style="font-family:monospace; font-size:1.05rem; color:{sc['color']}; margin-bottom:0.5rem; letter-spacing:1px;">{filled}{empty}</div>
+                <div style="font-size:0.88rem; opacity:0.85; margin-bottom:0.6rem;">{sc['verdict']}</div>
+                <div style="font-size:0.8rem; opacity:0.55; line-height:1.7;">
+                    ▼ 下落率 {d_str} &nbsp;→&nbsp; {sc['d_score']}/5<br>
+                    ↗ クロス {sc['c_label']} &nbsp;→&nbsp; {sc['c_score']}/3<br>
+                    🌐 地合い {sc['s_label']} &nbsp;→&nbsp; {sc['s_score']}/2
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    # ── Decline / watch display ──────────────────────────
     if watch_mode:
-        # Watch mode: show current price + today's change only
         st.markdown(
             f"""
             <div class="decline-block" style="background:rgba(91,156,246,0.08); border: 1.5px solid rgba(91,156,246,0.25);">
@@ -443,30 +554,20 @@ with tab1:
             unsafe_allow_html=True,
         )
     else:
-        # Dip mode: compute decline from recent high
-        recent_high = float(close.max())
-        recent_high_date = close.idxmax()
-        decline_pct = abs((current_price - recent_high) / recent_high * 100)
-        is_below_high = current_price < recent_high
-
         if not is_below_high:
             decline_color = "#00cc88"
             decline_bg = "rgba(0, 200, 136, 0.08)"
             decline_str = f"+{decline_pct:.1f}%"
             decline_caption = "▲ 高値圏（下落なし）"
         else:
-            # Heat ramp: deeper decline → hotter color (buy zone is near)
             if decline_pct >= 20:
-                decline_color = "#ff3b30"  # red
-                decline_bg = "rgba(255, 59, 48, 0.12)"
+                decline_color, decline_bg = "#ff3b30", "rgba(255, 59, 48, 0.12)"
                 zone_label = "全力買うゾーン"
             elif decline_pct >= 10:
-                decline_color = "#ff8c1a"  # deep orange
-                decline_bg = "rgba(255, 140, 26, 0.10)"
+                decline_color, decline_bg = "#ff8c1a", "rgba(255, 140, 26, 0.10)"
                 zone_label = "半分買うゾーン"
             else:
-                decline_color = "#ffcc33"  # yellow-orange
-                decline_bg = "rgba(255, 204, 51, 0.08)"
+                decline_color, decline_bg = "#ffcc33", "rgba(255, 204, 51, 0.08)"
                 zone_label = "まだ静観"
             decline_str = f"{decline_pct:.1f}%"
             decline_caption = f"▼ 高値から下落中 · {zone_label}"
@@ -482,126 +583,76 @@ with tab1:
             unsafe_allow_html=True,
         )
 
-    # ── Technical indicators ──────────────────────────────
-    ma_short = close.rolling(25).mean()
-    ma_long = close.rolling(75).mean()
-    rsi = compute_rsi(close)
-
-    # Golden / dead cross detection
-    combined_ma = pd.DataFrame({"s": ma_short, "l": ma_long}).dropna()
-    if len(combined_ma) >= 2:
-        diff = combined_ma["s"] - combined_ma["l"]
-        sign_prev = diff.shift(1)
-        golden_crosses = diff.index[(sign_prev < 0) & (diff >= 0)]
-        dead_crosses = diff.index[(sign_prev > 0) & (diff <= 0)]
-    else:
-        golden_crosses = pd.DatetimeIndex([])
-        dead_crosses = pd.DatetimeIndex([])
-
-    # ── Chart ─────────────────────────────────────────────
+    # ── Chart ────────────────────────────────────────────
     fig = make_subplots(
-        rows=2, cols=1,
-        shared_xaxes=True,
-        row_heights=[0.68, 0.32],
-        vertical_spacing=0.06,
+        rows=2, cols=1, shared_xaxes=True,
+        row_heights=[0.68, 0.32], vertical_spacing=0.06,
     )
 
-    # Price
     fig.add_trace(go.Scatter(
-        x=close.index,
-        y=close.values,
-        mode="lines",
-        name="終値",
+        x=close.index, y=close.values, mode="lines", name="終値",
         line=dict(color="#5b9cf6", width=2),
         hovertemplate="%{x|%Y/%m/%d}<br>%{y:,.0f}<extra></extra>",
     ), row=1, col=1)
 
-    # High marker (dip mode only)
     if not watch_mode:
         fig.add_trace(go.Scatter(
-            x=[recent_high_date],
-            y=[recent_high],
+            x=[recent_high_date], y=[recent_high],
             mode="markers+text",
             marker=dict(color="#ffb400", size=10, symbol="triangle-up"),
             text=[f"  高値 {recent_high:,.0f}"],
-            textposition="top right",
-            textfont=dict(color="#ffb400", size=11),
+            textposition="top right", textfont=dict(color="#ffb400", size=11),
             name="直近高値",
             hovertemplate="%{x|%Y/%m/%d}<br>%{y:,.0f}<extra>直近高値</extra>",
         ), row=1, col=1)
 
-    # MA25
     if ma_short.dropna().shape[0] > 0:
-        ma25_clean = ma_short.dropna()
+        ma25 = ma_short.dropna()
         fig.add_trace(go.Scatter(
-            x=ma25_clean.index,
-            y=ma25_clean.values,
-            mode="lines",
-            name="MA25",
-            line=dict(color="#ff9f43", width=1.5, dash="solid"),
+            x=ma25.index, y=ma25.values, mode="lines", name="MA25",
+            line=dict(color="#ff9f43", width=1.5),
             hovertemplate="%{x|%Y/%m/%d}<br>MA25: %{y:,.0f}<extra></extra>",
         ), row=1, col=1)
 
-    # MA75
     if ma_long.dropna().shape[0] > 0:
-        ma75_clean = ma_long.dropna()
+        ma75 = ma_long.dropna()
         fig.add_trace(go.Scatter(
-            x=ma75_clean.index,
-            y=ma75_clean.values,
-            mode="lines",
-            name="MA75",
-            line=dict(color="#a29bfe", width=1.5, dash="solid"),
+            x=ma75.index, y=ma75.values, mode="lines", name="MA75",
+            line=dict(color="#a29bfe", width=1.5),
             hovertemplate="%{x|%Y/%m/%d}<br>MA75: %{y:,.0f}<extra></extra>",
         ), row=1, col=1)
 
-    # Golden cross markers
     if len(golden_crosses) > 0:
         gc_y = ma_short.loc[golden_crosses]
         fig.add_trace(go.Scatter(
-            x=golden_crosses,
-            y=gc_y.values,
-            mode="markers",
+            x=golden_crosses, y=gc_y.values, mode="markers", name="GC",
             marker=dict(color="#00cc88", size=11, symbol="triangle-up"),
-            name="GC",
             hovertemplate="%{x|%Y/%m/%d}<br>ゴールデンクロス<extra></extra>",
         ), row=1, col=1)
 
-    # Dead cross markers
     if len(dead_crosses) > 0:
         dc_y = ma_short.loc[dead_crosses]
         fig.add_trace(go.Scatter(
-            x=dead_crosses,
-            y=dc_y.values,
-            mode="markers",
+            x=dead_crosses, y=dc_y.values, mode="markers", name="DC",
             marker=dict(color="#ff3c3c", size=11, symbol="triangle-down"),
-            name="DC",
             hovertemplate="%{x|%Y/%m/%d}<br>デッドクロス<extra></extra>",
         ), row=1, col=1)
 
-    # Current price line (main chart only)
     fig.add_hline(
-        y=current_price,
-        line_dash="dot",
-        line_color="rgba(255,255,255,0.3)",
+        y=current_price, line_dash="dot", line_color="rgba(255,255,255,0.3)",
         annotation_text=f"現在 {current_price:,.0f}",
         annotation_position="bottom right",
         annotation_font_color="rgba(255,255,255,0.6)",
         row=1, col=1,
     )
 
-    # RSI
     rsi_clean = rsi.dropna()
     if len(rsi_clean) > 0:
         fig.add_trace(go.Scatter(
-            x=rsi_clean.index,
-            y=rsi_clean.values,
-            mode="lines",
-            name="RSI(14)",
+            x=rsi_clean.index, y=rsi_clean.values, mode="lines", name="RSI(14)",
             line=dict(color="#74b9ff", width=1.5),
             hovertemplate="%{x|%Y/%m/%d}<br>RSI: %{y:.1f}<extra></extra>",
         ), row=2, col=1)
-
-        # Overbought / oversold zones
         fig.add_hrect(y0=70, y1=100, fillcolor="rgba(255,60,60,0.08)", line_width=0, row=2, col=1)
         fig.add_hrect(y0=0, y1=30, fillcolor="rgba(0,200,136,0.08)", line_width=0, row=2, col=1)
         fig.add_hline(y=70, line_dash="dash", line_color="rgba(255,60,60,0.55)", row=2, col=1,
@@ -613,43 +664,27 @@ with tab1:
 
     fig.update_layout(
         template="plotly_dark",
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(26,31,46,0.8)",
-        margin=dict(l=0, r=0, t=10, b=10),
-        height=400,
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(26,31,46,0.8)",
+        margin=dict(l=0, r=0, t=10, b=10), height=400,
         showlegend=True,
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.01,
-            xanchor="right",
-            x=1,
-            font=dict(size=10),
-            bgcolor="rgba(0,0,0,0)",
-        ),
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1,
+                    font=dict(size=10), bgcolor="rgba(0,0,0,0)"),
         xaxis=dict(showgrid=False, zeroline=False),
         yaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.05)", zeroline=False),
         xaxis2=dict(showgrid=False, zeroline=False),
-        yaxis2=dict(
-            showgrid=True,
-            gridcolor="rgba(255,255,255,0.05)",
-            zeroline=False,
-            range=[0, 100],
-            tickvals=[0, 30, 50, 70, 100],
-        ),
+        yaxis2=dict(showgrid=True, gridcolor="rgba(255,255,255,0.05)", zeroline=False,
+                    range=[0, 100], tickvals=[0, 30, 50, 70, 100]),
         hovermode="x unified",
     )
-
     fig.update_yaxes(title_text="RSI", title_font_size=10, row=2, col=1)
-
     st.plotly_chart(fig, use_container_width=True)
 
-    cur_date_str = current_date.strftime("%Y/%m/%d") if hasattr(current_date, "strftime") else str(current_date)
+    cur_date_str = (current_date.strftime("%Y/%m/%d")
+                    if hasattr(current_date, "strftime") else str(current_date))
 
+    # ── Post-chart content ───────────────────────────────
     if watch_mode:
-        # ── Watch mode: info only, no judgment ───────────
         st.info("👀 ウォッチ専用銘柄です。ディップ判定（買い増し目安）は表示しません。")
-
         with st.expander("詳細", expanded=True):
             rows = [
                 ("現在値", f"{current_price:,.2f}　({cur_date_str})"),
@@ -664,27 +699,18 @@ with tab1:
                 unsafe_allow_html=True,
             )
     else:
-        # ── Funds input ──────────────────────────────────
         st.markdown("#### 待機資金")
         if "waiting_funds" not in st.session_state:
             st.session_state.waiting_funds = 1_000_000
-
         waiting_funds = st.number_input(
-            "合計額（円）",
-            min_value=0,
-            value=st.session_state.waiting_funds,
-            step=100_000,
-            format="%d",
-            key="waiting_funds",
+            "合計額（円）", min_value=0, value=st.session_state.waiting_funds,
+            step=100_000, format="%d", key="waiting_funds",
         )
 
-        # ── Judgment ─────────────────────────────────────
         judgment = get_judgment(decline_pct if is_below_high else 0, waiting_funds)
-
         amount_html = ""
         if judgment["amount"] > 0:
             amount_html = f'<div class="judgment-amount">¥{judgment["amount"]:,.0f}</div>'
-
         st.markdown(
             f"""
             <div class="judgment-block" style="background:{judgment['bg']}; border: 1.5px solid {judgment['border']}44;">
@@ -696,9 +722,9 @@ with tab1:
             unsafe_allow_html=True,
         )
 
-        # ── Data summary ─────────────────────────────────
         with st.expander("判定の根拠", expanded=True):
-            high_date_str = recent_high_date.strftime("%Y/%m/%d") if hasattr(recent_high_date, "strftime") else str(recent_high_date)
+            high_date_str = (recent_high_date.strftime("%Y/%m/%d")
+                             if hasattr(recent_high_date, "strftime") else str(recent_high_date))
             rows = [
                 ("直近高値", f"{recent_high:,.0f}　({high_date_str})"),
                 ("現在値", f"{current_price:,.0f}　({cur_date_str})"),
@@ -715,17 +741,36 @@ with tab1:
                 unsafe_allow_html=True,
             )
 
+    # ── News ─────────────────────────────────────────────
+    st.markdown("#### 関連ニュース")
+    news_items = fetch_news(ticker)
+    if not news_items:
+        st.caption("ニュースを取得できませんでした。")
+    else:
+        for item in news_items[:5]:
+            title = item.get("title", "")
+            link = item.get("link", "")
+            publisher = item.get("publisher", "")
+            ts = item.get("providerPublishTime", 0)
+            pub_time = datetime.fromtimestamp(ts).strftime("%m/%d %H:%M") if ts else ""
+            meta = f"{publisher}　{pub_time}".strip()
+            if link:
+                st.markdown(
+                    f"- [{title}]({link})"
+                    + (f"  \n  <span style='font-size:0.8rem;opacity:0.5;'>{meta}</span>" if meta else ""),
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(f"- {title}")
+
 
 # ════════════════════════════════════════════════════
-# TAB 2 — Sector comparison (new)
+# TAB 2 — Sector comparison
 # ════════════════════════════════════════════════════
 with tab2:
     period_label = st.radio(
-        "騰落率の期間",
-        list(SECTOR_PERIODS.keys()),
-        index=1,  # 1ヶ月がデフォルト
-        horizontal=True,
-        key="sector_period",
+        "騰落率の期間", list(SECTOR_PERIODS.keys()), index=1,
+        horizontal=True, key="sector_period",
     )
     period_days = SECTOR_PERIODS[period_label]
 
@@ -739,7 +784,6 @@ with tab2:
             else:
                 returns[f"{etf}  {name}"] = ret
 
-        # Always fetch 1M and 6M for cross-period summary (cache handles dedup)
         returns_1m: dict[str, float] = {}
         returns_6m: dict[str, float] = {}
         for etf, name in SECTORS.items():
@@ -757,7 +801,6 @@ with tab2:
     if not returns:
         st.warning("セクターデータを取得できませんでした。しばらく待ってから再試行してください。")
     else:
-        # Sort ascending so highest return is at the top of a horizontal bar chart
         sorted_items = sorted(returns.items(), key=lambda x: x[1])
         labels = [item[0] for item in sorted_items]
         values = [item[1] for item in sorted_items]
@@ -776,42 +819,30 @@ with tab2:
         )
 
         fig_sector = go.Figure(go.Bar(
-            x=values,
-            y=labels,
-            orientation="h",
-            marker_color=colors,
+            x=values, y=labels, orientation="h", marker_color=colors,
             text=[f"{v:+.1f}%" for v in values],
-            textposition="outside",
-            cliponaxis=False,
+            textposition="outside", cliponaxis=False,
             hovertemplate="%{y}<br>%{x:+.2f}%<extra></extra>",
         ))
 
         x_abs_max = max(abs(v) for v in values) if values else 1
-        x_padding = x_abs_max * 0.25  # room for outside text labels
+        x_padding = x_abs_max * 0.25
 
         fig_sector.update_layout(
             template="plotly_dark",
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(26,31,46,0.8)",
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(26,31,46,0.8)",
             margin=dict(l=10, r=10, t=10, b=10),
             height=max(280, len(labels) * 44),
             showlegend=False,
-            xaxis=dict(
-                showgrid=True,
-                gridcolor="rgba(255,255,255,0.05)",
-                zeroline=True,
-                zerolinecolor="rgba(255,255,255,0.25)",
-                ticksuffix="%",
-                range=[-(x_abs_max + x_padding), x_abs_max + x_padding],
-            ),
+            xaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.05)",
+                       zeroline=True, zerolinecolor="rgba(255,255,255,0.25)",
+                       ticksuffix="%",
+                       range=[-(x_abs_max + x_padding), x_abs_max + x_padding]),
             yaxis=dict(showgrid=False, tickfont=dict(size=12)),
         )
-
         st.plotly_chart(fig_sector, use_container_width=True)
-
         st.caption(f"期間: 直近{period_label} の騰落率（強い順）")
 
-        # ── Cross-period summary ──────────────────────────
         summary = cross_period_summary(returns_1m, returns_6m)
         if summary:
             st.markdown("**📊 期間横断の総評**")
