@@ -236,6 +236,83 @@ def market_mood(returns: dict, period_label: str) -> dict:
     return {"icon": icon, "text": text, "bg": bg, "border": border}
 
 
+def cross_period_summary(returns_1m: dict, returns_6m: dict) -> dict | None:
+    """Compare 1M vs 6M sector returns to surface trend-change signals."""
+    if len(returns_1m) < 2 or len(returns_6m) < 2:
+        return None
+
+    OFFENSIVE = {"SOXX", "XLK", "XLY"}
+    DEFENSIVE = {"XLP", "XLV"}
+
+    def ticker_of(label: str) -> str:
+        return label.split()[0]
+
+    ranked_1m = sorted(returns_1m.items(), key=lambda x: x[1], reverse=True)
+    ranked_6m = sorted(returns_6m.items(), key=lambda x: x[1], reverse=True)
+
+    top3_1m = [ticker_of(lbl) for lbl, _ in ranked_1m[:3]]
+    top3_6m = [ticker_of(lbl) for lbl, _ in ranked_6m[:3]]
+    off_1m = sum(1 for t in top3_1m if t in OFFENSIVE)
+    def_1m = sum(1 for t in top3_1m if t in DEFENSIVE)
+    off_6m = sum(1 for t in top3_6m if t in OFFENSIVE)
+    def_6m = sum(1 for t in top3_6m if t in DEFENSIVE)
+
+    top_1m = ticker_of(ranked_1m[0][0])
+    top_6m = ticker_of(ranked_6m[0][0])
+    name_1m = SECTORS.get(top_1m, top_1m)
+    name_6m = SECTORS.get(top_6m, top_6m)
+
+    tickers_1m_list = [ticker_of(lbl) for lbl, _ in ranked_1m]
+    rank_6m_in_1m = (tickers_1m_list.index(top_6m) + 1
+                     if top_6m in tickers_1m_list else None)
+
+    # Case: defensive sectors newly rising in 1M vs 6M
+    if def_1m > def_6m and def_1m >= 1:
+        return {
+            "icon": "⚠️",
+            "text": ("短期（1ヶ月）で守りのセクターが長期（6ヶ月）よりも上位に浮上している傾向です。"
+                     "資金が守りに回り始め、地合い悪化の初期サインかもしれません。"),
+            "bg": "rgba(255,204,51,0.07)", "border": "#ffcc33",
+        }
+
+    # Case: offensive sectors accelerating in 1M vs 6M
+    if off_1m > off_6m and off_1m >= 2:
+        return {
+            "icon": "📈",
+            "text": ("短期（1ヶ月）で攻めのセクターが長期（6ヶ月）よりも上位に浮上している傾向です。"
+                     "リスクオンが加速してきた可能性が感じられます。"),
+            "bg": "rgba(0,200,136,0.07)", "border": "#00cc88",
+        }
+
+    # Case: same top sector in both periods — trend continuation
+    if top_1m == top_6m:
+        return {
+            "icon": "➡️",
+            "text": (f"短期・長期ともに{name_1m}がトップの傾向で、現在の流れが継続している可能性があります。"
+                     "セクターローテーションの兆候は現時点では目立ちません。"),
+            "bg": "rgba(91,156,246,0.07)", "border": "#5b9cf6",
+        }
+
+    # Case: 6M leader has slipped out of 1M top 3 — possible reversal
+    if rank_6m_in_1m is not None and rank_6m_in_1m > 3:
+        position = "下位" if rank_6m_in_1m > len(tickers_1m_list) // 2 else "中位"
+        return {
+            "icon": "🔄",
+            "text": (f"長期（6ヶ月）でトップだった{name_6m}が、短期（1ヶ月）では{position}に後退している傾向です。"
+                     "長期の主役が足元で失速し、潮目が変わりかけの可能性も考えられます。"),
+            "bg": "rgba(255,140,0,0.07)", "border": "#ff8c00",
+        }
+
+    # Fallback: general rotation
+    return {
+        "icon": "🔄",
+        "text": (f"長期（6ヶ月）のトップは{name_6m}でしたが、"
+                 f"短期（1ヶ月）では{name_1m}が強さを見せている傾向です。"
+                 "セクター間のローテーションが起きている可能性があります。"),
+        "bg": "rgba(255,140,0,0.07)", "border": "#ff8c00",
+    }
+
+
 def get_judgment(decline_pct: float, funds: float) -> dict:
     if decline_pct >= 20:
         return {
@@ -662,6 +739,18 @@ with tab2:
             else:
                 returns[f"{etf}  {name}"] = ret
 
+        # Always fetch 1M and 6M for cross-period summary (cache handles dedup)
+        returns_1m: dict[str, float] = {}
+        returns_6m: dict[str, float] = {}
+        for etf, name in SECTORS.items():
+            key = f"{etf}  {name}"
+            r1 = returns[key] if period_days == 30 and key in returns else fetch_sector_return(etf, 30)
+            if r1 is not None:
+                returns_1m[key] = r1
+            r6 = returns[key] if period_days == 180 and key in returns else fetch_sector_return(etf, 180)
+            if r6 is not None:
+                returns_6m[key] = r6
+
     if skipped:
         st.caption(f"データ取得不可のためスキップ: {', '.join(skipped)}")
 
@@ -721,3 +810,18 @@ with tab2:
         st.plotly_chart(fig_sector, use_container_width=True)
 
         st.caption(f"期間: 直近{period_label} の騰落率（強い順）")
+
+        # ── Cross-period summary ──────────────────────────
+        summary = cross_period_summary(returns_1m, returns_6m)
+        if summary:
+            st.markdown("**📊 期間横断の総評**")
+            st.markdown(
+                f"""
+                <div style="padding:0.85rem 1.1rem; border-radius:12px;
+                            background:{summary['bg']}; border:1.5px solid {summary['border']}55;
+                            margin-top:0.25rem; font-size:0.92rem; line-height:1.65;">
+                    <span style="font-size:1.05rem;">{summary['icon']}</span>&nbsp;{summary['text']}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
