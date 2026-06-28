@@ -2,6 +2,7 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 
 st.set_page_config(
@@ -132,6 +133,16 @@ def fetch_quote(ticker: str) -> dict:
     except Exception:
         pass
     return result
+
+
+def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, float("inf"))
+    return 100 - (100 / (1 + rs))
 
 
 def get_judgment(decline_pct: float, funds: float) -> dict:
@@ -297,9 +308,31 @@ else:
         unsafe_allow_html=True,
     )
 
-# ── Chart ─────────────────────────────────────────────
-fig = go.Figure()
+# ── Technical indicators ──────────────────────────────
+ma_short = close.rolling(25).mean()
+ma_long = close.rolling(75).mean()
+rsi = compute_rsi(close)
 
+# Golden / dead cross detection
+combined_ma = pd.DataFrame({"s": ma_short, "l": ma_long}).dropna()
+if len(combined_ma) >= 2:
+    diff = combined_ma["s"] - combined_ma["l"]
+    sign_prev = diff.shift(1)
+    golden_crosses = diff.index[(sign_prev < 0) & (diff >= 0)]
+    dead_crosses = diff.index[(sign_prev > 0) & (diff <= 0)]
+else:
+    golden_crosses = pd.DatetimeIndex([])
+    dead_crosses = pd.DatetimeIndex([])
+
+# ── Chart ─────────────────────────────────────────────
+fig = make_subplots(
+    rows=2, cols=1,
+    shared_xaxes=True,
+    row_heights=[0.68, 0.32],
+    vertical_spacing=0.06,
+)
+
+# Price
 fig.add_trace(go.Scatter(
     x=close.index,
     y=close.values,
@@ -307,7 +340,7 @@ fig.add_trace(go.Scatter(
     name="終値",
     line=dict(color="#5b9cf6", width=2),
     hovertemplate="%{x|%Y/%m/%d}<br>%{y:,.0f}<extra></extra>",
-))
+), row=1, col=1)
 
 # High marker (dip mode only)
 if not watch_mode:
@@ -321,9 +354,57 @@ if not watch_mode:
         textfont=dict(color="#ffb400", size=11),
         name="直近高値",
         hovertemplate="%{x|%Y/%m/%d}<br>%{y:,.0f}<extra>直近高値</extra>",
-    ))
+    ), row=1, col=1)
 
-# Current price line
+# MA25
+if ma_short.dropna().shape[0] > 0:
+    ma25_clean = ma_short.dropna()
+    fig.add_trace(go.Scatter(
+        x=ma25_clean.index,
+        y=ma25_clean.values,
+        mode="lines",
+        name="MA25",
+        line=dict(color="#ff9f43", width=1.5, dash="solid"),
+        hovertemplate="%{x|%Y/%m/%d}<br>MA25: %{y:,.0f}<extra></extra>",
+    ), row=1, col=1)
+
+# MA75
+if ma_long.dropna().shape[0] > 0:
+    ma75_clean = ma_long.dropna()
+    fig.add_trace(go.Scatter(
+        x=ma75_clean.index,
+        y=ma75_clean.values,
+        mode="lines",
+        name="MA75",
+        line=dict(color="#a29bfe", width=1.5, dash="solid"),
+        hovertemplate="%{x|%Y/%m/%d}<br>MA75: %{y:,.0f}<extra></extra>",
+    ), row=1, col=1)
+
+# Golden cross markers
+if len(golden_crosses) > 0:
+    gc_y = ma_short.loc[golden_crosses]
+    fig.add_trace(go.Scatter(
+        x=golden_crosses,
+        y=gc_y.values,
+        mode="markers",
+        marker=dict(color="#00cc88", size=11, symbol="triangle-up"),
+        name="GC",
+        hovertemplate="%{x|%Y/%m/%d}<br>ゴールデンクロス<extra></extra>",
+    ), row=1, col=1)
+
+# Dead cross markers
+if len(dead_crosses) > 0:
+    dc_y = ma_short.loc[dead_crosses]
+    fig.add_trace(go.Scatter(
+        x=dead_crosses,
+        y=dc_y.values,
+        mode="markers",
+        marker=dict(color="#ff3c3c", size=11, symbol="triangle-down"),
+        name="DC",
+        hovertemplate="%{x|%Y/%m/%d}<br>デッドクロス<extra></extra>",
+    ), row=1, col=1)
+
+# Current price line (main chart only)
 fig.add_hline(
     y=current_price,
     line_dash="dot",
@@ -331,19 +412,61 @@ fig.add_hline(
     annotation_text=f"現在 {current_price:,.0f}",
     annotation_position="bottom right",
     annotation_font_color="rgba(255,255,255,0.6)",
+    row=1, col=1,
 )
+
+# RSI
+rsi_clean = rsi.dropna()
+if len(rsi_clean) > 0:
+    fig.add_trace(go.Scatter(
+        x=rsi_clean.index,
+        y=rsi_clean.values,
+        mode="lines",
+        name="RSI(14)",
+        line=dict(color="#74b9ff", width=1.5),
+        hovertemplate="%{x|%Y/%m/%d}<br>RSI: %{y:.1f}<extra></extra>",
+    ), row=2, col=1)
+
+    # Overbought / oversold zones
+    fig.add_hrect(y0=70, y1=100, fillcolor="rgba(255,60,60,0.08)", line_width=0, row=2, col=1)
+    fig.add_hrect(y0=0, y1=30, fillcolor="rgba(0,200,136,0.08)", line_width=0, row=2, col=1)
+    fig.add_hline(y=70, line_dash="dash", line_color="rgba(255,60,60,0.55)", row=2, col=1,
+                  annotation_text="70", annotation_position="right",
+                  annotation_font_color="rgba(255,60,60,0.8)", annotation_font_size=10)
+    fig.add_hline(y=30, line_dash="dash", line_color="rgba(0,200,136,0.55)", row=2, col=1,
+                  annotation_text="30", annotation_position="right",
+                  annotation_font_color="rgba(0,200,136,0.8)", annotation_font_size=10)
 
 fig.update_layout(
     template="plotly_dark",
     paper_bgcolor="rgba(0,0,0,0)",
     plot_bgcolor="rgba(26,31,46,0.8)",
     margin=dict(l=0, r=0, t=10, b=10),
-    height=260,
-    showlegend=False,
+    height=400,
+    showlegend=True,
+    legend=dict(
+        orientation="h",
+        yanchor="bottom",
+        y=1.01,
+        xanchor="right",
+        x=1,
+        font=dict(size=10),
+        bgcolor="rgba(0,0,0,0)",
+    ),
     xaxis=dict(showgrid=False, zeroline=False),
     yaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.05)", zeroline=False),
+    xaxis2=dict(showgrid=False, zeroline=False),
+    yaxis2=dict(
+        showgrid=True,
+        gridcolor="rgba(255,255,255,0.05)",
+        zeroline=False,
+        range=[0, 100],
+        tickvals=[0, 30, 50, 70, 100],
+    ),
     hovermode="x unified",
 )
+
+fig.update_yaxes(title_text="RSI", title_font_size=10, row=2, col=1)
 
 st.plotly_chart(fig, use_container_width=True)
 
