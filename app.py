@@ -96,6 +96,18 @@ WATCH = {
 
 ALL_OPTIONS = {**INDICES, **WATCH}
 
+SECTORS = {
+    "SOXX": "半導体",
+    "XLK": "テクノロジー",
+    "XLF": "金融",
+    "XLE": "エネルギー",
+    "XLV": "ヘルスケア",
+    "XLY": "一般消費財",
+    "XLP": "生活必需品",
+}
+
+SECTOR_PERIODS = {"1週間": 7, "1ヶ月": 30, "3ヶ月": 90, "6ヶ月": 180}
+
 
 @st.cache_data(ttl=300)
 def fetch_data(ticker: str, months: int) -> pd.DataFrame:
@@ -133,6 +145,35 @@ def fetch_quote(ticker: str) -> dict:
     except Exception:
         pass
     return result
+
+
+@st.cache_data(ttl=300)
+def fetch_sector_return(ticker: str, period_days: int) -> float | None:
+    """Returns percentage change over period_days. None on any failure."""
+    try:
+        end = datetime.now()
+        start = end - timedelta(days=period_days + 5)  # buffer for non-trading days
+        df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        if df.empty or "Close" not in df.columns:
+            return None
+        close = df["Close"].squeeze()
+        if not isinstance(close, pd.Series):
+            close = pd.Series([close], index=[df.index[-1]])
+        close = close.dropna()
+        # Need at least first price (period start) and last price
+        target_start = datetime.now() - timedelta(days=period_days)
+        eligible = close[close.index >= pd.Timestamp(target_start.date())]
+        if len(eligible) < 1 or len(close) < 2:
+            return None
+        start_price = float(close.iloc[0])
+        end_price = float(eligible.iloc[-1])
+        if start_price == 0:
+            return None
+        return (end_price - start_price) / start_price * 100
+    except Exception:
+        return None
 
 
 def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
@@ -175,368 +216,446 @@ def get_judgment(decline_pct: float, funds: float) -> dict:
 # ── Header ──────────────────────────────────────────
 st.title("📉 Dip Buy Guide")
 
-# ── Index selector ──────────────────────────────────
-selected_label = st.radio("銘柄", list(ALL_OPTIONS.keys()), horizontal=True)
-ticker = ALL_OPTIONS[selected_label]
-watch_mode = selected_label in WATCH
+tab1, tab2 = st.tabs(["📉 ディップ判定", "🔥 セクター比較"])
 
-# ── Period slider ────────────────────────────────────
-period_months = st.slider(
-    "表示期間" if watch_mode else "高値を測る期間",
-    min_value=3,
-    max_value=36,
-    value=12,
-    step=3,
-    format="%dヶ月",
-)
+# ════════════════════════════════════════════════════
+# TAB 1 — Dip judgment (existing content, unchanged)
+# ════════════════════════════════════════════════════
+with tab1:
+    # ── Index selector ──────────────────────────────────
+    selected_label = st.radio("銘柄", list(ALL_OPTIONS.keys()), horizontal=True)
+    ticker = ALL_OPTIONS[selected_label]
+    watch_mode = selected_label in WATCH
 
-# ── Fetch ────────────────────────────────────────────
-with st.spinner("データ取得中..."):
-    df = fetch_data(ticker, period_months)
+    # ── Period slider ────────────────────────────────────
+    period_months = st.slider(
+        "表示期間" if watch_mode else "高値を測る期間",
+        min_value=3,
+        max_value=36,
+        value=12,
+        step=3,
+        format="%dヶ月",
+    )
 
-# Build a clean Close series. yfinance can return a trailing NaN row for the
-# current (still-forming) session; dropna() prevents NaN current_price/decline.
-close = pd.Series(dtype="float64")
-if not df.empty and "Close" in df.columns:
-    close = df["Close"].squeeze()
-    if not isinstance(close, pd.Series):  # single-row frame squeezes to scalar
-        close = pd.Series([close], index=[df.index[-1]])
-    close = close.dropna()
+    # ── Fetch ────────────────────────────────────────────
+    with st.spinner("データ取得中..."):
+        df = fetch_data(ticker, period_months)
 
-# ── No usable data ───────────────────────────────────
-if close.empty:
+    # Build a clean Close series. yfinance can return a trailing NaN row for the
+    # current (still-forming) session; dropna() prevents NaN current_price/decline.
+    close = pd.Series(dtype="float64")
+    if not df.empty and "Close" in df.columns:
+        close = df["Close"].squeeze()
+        if not isinstance(close, pd.Series):  # single-row frame squeezes to scalar
+            close = pd.Series([close], index=[df.index[-1]])
+        close = close.dropna()
+
+    # ── No usable data ───────────────────────────────────
+    if close.empty:
+        if watch_mode:
+            st.markdown(
+                f"""
+                <div class="decline-block" style="background:rgba(255,255,255,0.04); border: 1.5px solid rgba(255,255,255,0.15);">
+                    <div class="decline-label" style="opacity:0.6;">👀 ウォッチ中</div>
+                    <div class="decline-pct" style="color:#888; font-size:2.2rem;">— —</div>
+                    <div class="decline-label">データ取得不可（{ticker}）</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            st.caption("この銘柄は現在 yfinance から価格データを取得できません。時間をおいて再度お試しください。")
+        else:
+            st.error("データの取得に失敗しました。しばらく待ってから再試行してください。")
+        st.stop()
+
+    # ── Common calculations ──────────────────────────────
+    # Daily download lags (its last bar can be a session or more old), so prefer
+    # the live fast_info quote for current price and the true previous close.
+    quote = fetch_quote(ticker)
+    hist_last = float(close.iloc[-1])
+    current_price = quote["last_price"] if quote["last_price"] is not None else hist_last
+
+    if quote["prev_close"] is not None:
+        prev_close = quote["prev_close"]
+    elif len(close) >= 2:
+        prev_close = float(close.iloc[-2])
+    else:
+        prev_close = current_price
+
+    today_change_pct = (current_price - prev_close) / prev_close * 100 if prev_close else 0.0
+
+    # Reflect the live price on the chart series so the tip and the recent-high
+    # calculation match the real market instead of a stale daily bar.
+    last_date = close.index[-1]
+    is_today = hasattr(last_date, "date") and last_date.date() == datetime.now().date()
+    if is_today:
+        close.iloc[-1] = current_price
+    else:
+        close.loc[pd.Timestamp(datetime.now().date())] = current_price
+    current_date = close.index[-1]
+
+    today_color = "#00cc88" if today_change_pct >= 0 else "#ff3c3c"
+    today_sign = "+" if today_change_pct >= 0 else ""
+    today_html = (
+        f'<div class="today-change" style="color:{today_color};">'
+        f'今日: {today_sign}{today_change_pct:.1f}%</div>'
+    )
+
+    # ── Main display ─────────────────────────────────────
     if watch_mode:
+        # Watch mode: show current price + today's change only
         st.markdown(
             f"""
-            <div class="decline-block" style="background:rgba(255,255,255,0.04); border: 1.5px solid rgba(255,255,255,0.15);">
+            <div class="decline-block" style="background:rgba(91,156,246,0.08); border: 1.5px solid rgba(91,156,246,0.25);">
                 <div class="decline-label" style="opacity:0.6;">👀 ウォッチ中</div>
-                <div class="decline-pct" style="color:#888; font-size:2.2rem;">— —</div>
-                <div class="decline-label">データ取得不可（{ticker}）</div>
+                <div class="decline-pct" style="color:#5b9cf6; font-size:3rem;">{current_price:,.1f}</div>
+                <div class="decline-label">現在値</div>
+                {today_html}
             </div>
             """,
             unsafe_allow_html=True,
         )
-        st.caption("この銘柄は現在 yfinance から価格データを取得できません。時間をおいて再度お試しください。")
     else:
-        st.error("データの取得に失敗しました。しばらく待ってから再試行してください。")
-    st.stop()
+        # Dip mode: compute decline from recent high
+        recent_high = float(close.max())
+        recent_high_date = close.idxmax()
+        decline_pct = abs((current_price - recent_high) / recent_high * 100)
+        is_below_high = current_price < recent_high
 
-# ── Common calculations ──────────────────────────────
-# Daily download lags (its last bar can be a session or more old), so prefer
-# the live fast_info quote for current price and the true previous close.
-quote = fetch_quote(ticker)
-hist_last = float(close.iloc[-1])
-current_price = quote["last_price"] if quote["last_price"] is not None else hist_last
-
-if quote["prev_close"] is not None:
-    prev_close = quote["prev_close"]
-elif len(close) >= 2:
-    prev_close = float(close.iloc[-2])
-else:
-    prev_close = current_price
-
-today_change_pct = (current_price - prev_close) / prev_close * 100 if prev_close else 0.0
-
-# Reflect the live price on the chart series so the tip and the recent-high
-# calculation match the real market instead of a stale daily bar.
-last_date = close.index[-1]
-is_today = hasattr(last_date, "date") and last_date.date() == datetime.now().date()
-if is_today:
-    close.iloc[-1] = current_price
-else:
-    close.loc[pd.Timestamp(datetime.now().date())] = current_price
-current_date = close.index[-1]
-
-today_color = "#00cc88" if today_change_pct >= 0 else "#ff3c3c"
-today_sign = "+" if today_change_pct >= 0 else ""
-today_html = (
-    f'<div class="today-change" style="color:{today_color};">'
-    f'今日: {today_sign}{today_change_pct:.1f}%</div>'
-)
-
-# ── Main display ─────────────────────────────────────
-if watch_mode:
-    # Watch mode: show current price + today's change only
-    st.markdown(
-        f"""
-        <div class="decline-block" style="background:rgba(91,156,246,0.08); border: 1.5px solid rgba(91,156,246,0.25);">
-            <div class="decline-label" style="opacity:0.6;">👀 ウォッチ中</div>
-            <div class="decline-pct" style="color:#5b9cf6; font-size:3rem;">{current_price:,.1f}</div>
-            <div class="decline-label">現在値</div>
-            {today_html}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-else:
-    # Dip mode: compute decline from recent high
-    recent_high = float(close.max())
-    recent_high_date = close.idxmax()
-    decline_pct = abs((current_price - recent_high) / recent_high * 100)
-    is_below_high = current_price < recent_high
-
-    if not is_below_high:
-        decline_color = "#00cc88"
-        decline_bg = "rgba(0, 200, 136, 0.08)"
-        decline_str = f"+{decline_pct:.1f}%"
-        decline_caption = "▲ 高値圏（下落なし）"
-    else:
-        # Heat ramp: deeper decline → hotter color (buy zone is near)
-        if decline_pct >= 20:
-            decline_color = "#ff3b30"  # red
-            decline_bg = "rgba(255, 59, 48, 0.12)"
-            zone_label = "全力買うゾーン"
-        elif decline_pct >= 10:
-            decline_color = "#ff8c1a"  # deep orange
-            decline_bg = "rgba(255, 140, 26, 0.10)"
-            zone_label = "半分買うゾーン"
+        if not is_below_high:
+            decline_color = "#00cc88"
+            decline_bg = "rgba(0, 200, 136, 0.08)"
+            decline_str = f"+{decline_pct:.1f}%"
+            decline_caption = "▲ 高値圏（下落なし）"
         else:
-            decline_color = "#ffcc33"  # yellow-orange
-            decline_bg = "rgba(255, 204, 51, 0.08)"
-            zone_label = "まだ静観"
-        decline_str = f"{decline_pct:.1f}%"
-        decline_caption = f"▼ 高値から下落中 · {zone_label}"
+            # Heat ramp: deeper decline → hotter color (buy zone is near)
+            if decline_pct >= 20:
+                decline_color = "#ff3b30"  # red
+                decline_bg = "rgba(255, 59, 48, 0.12)"
+                zone_label = "全力買うゾーン"
+            elif decline_pct >= 10:
+                decline_color = "#ff8c1a"  # deep orange
+                decline_bg = "rgba(255, 140, 26, 0.10)"
+                zone_label = "半分買うゾーン"
+            else:
+                decline_color = "#ffcc33"  # yellow-orange
+                decline_bg = "rgba(255, 204, 51, 0.08)"
+                zone_label = "まだ静観"
+            decline_str = f"{decline_pct:.1f}%"
+            decline_caption = f"▼ 高値から下落中 · {zone_label}"
 
-    st.markdown(
-        f"""
-        <div class="decline-block" style="background:{decline_bg}; border: 1.5px solid {decline_color}55;">
-            <div class="decline-pct" style="color:{decline_color};">{decline_str}</div>
-            <div class="decline-label" style="color:{decline_color}; opacity:0.95; font-weight:600;">{decline_caption}</div>
-            {today_html}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-# ── Technical indicators ──────────────────────────────
-ma_short = close.rolling(25).mean()
-ma_long = close.rolling(75).mean()
-rsi = compute_rsi(close)
-
-# Golden / dead cross detection
-combined_ma = pd.DataFrame({"s": ma_short, "l": ma_long}).dropna()
-if len(combined_ma) >= 2:
-    diff = combined_ma["s"] - combined_ma["l"]
-    sign_prev = diff.shift(1)
-    golden_crosses = diff.index[(sign_prev < 0) & (diff >= 0)]
-    dead_crosses = diff.index[(sign_prev > 0) & (diff <= 0)]
-else:
-    golden_crosses = pd.DatetimeIndex([])
-    dead_crosses = pd.DatetimeIndex([])
-
-# ── Chart ─────────────────────────────────────────────
-fig = make_subplots(
-    rows=2, cols=1,
-    shared_xaxes=True,
-    row_heights=[0.68, 0.32],
-    vertical_spacing=0.06,
-)
-
-# Price
-fig.add_trace(go.Scatter(
-    x=close.index,
-    y=close.values,
-    mode="lines",
-    name="終値",
-    line=dict(color="#5b9cf6", width=2),
-    hovertemplate="%{x|%Y/%m/%d}<br>%{y:,.0f}<extra></extra>",
-), row=1, col=1)
-
-# High marker (dip mode only)
-if not watch_mode:
-    fig.add_trace(go.Scatter(
-        x=[recent_high_date],
-        y=[recent_high],
-        mode="markers+text",
-        marker=dict(color="#ffb400", size=10, symbol="triangle-up"),
-        text=[f"  高値 {recent_high:,.0f}"],
-        textposition="top right",
-        textfont=dict(color="#ffb400", size=11),
-        name="直近高値",
-        hovertemplate="%{x|%Y/%m/%d}<br>%{y:,.0f}<extra>直近高値</extra>",
-    ), row=1, col=1)
-
-# MA25
-if ma_short.dropna().shape[0] > 0:
-    ma25_clean = ma_short.dropna()
-    fig.add_trace(go.Scatter(
-        x=ma25_clean.index,
-        y=ma25_clean.values,
-        mode="lines",
-        name="MA25",
-        line=dict(color="#ff9f43", width=1.5, dash="solid"),
-        hovertemplate="%{x|%Y/%m/%d}<br>MA25: %{y:,.0f}<extra></extra>",
-    ), row=1, col=1)
-
-# MA75
-if ma_long.dropna().shape[0] > 0:
-    ma75_clean = ma_long.dropna()
-    fig.add_trace(go.Scatter(
-        x=ma75_clean.index,
-        y=ma75_clean.values,
-        mode="lines",
-        name="MA75",
-        line=dict(color="#a29bfe", width=1.5, dash="solid"),
-        hovertemplate="%{x|%Y/%m/%d}<br>MA75: %{y:,.0f}<extra></extra>",
-    ), row=1, col=1)
-
-# Golden cross markers
-if len(golden_crosses) > 0:
-    gc_y = ma_short.loc[golden_crosses]
-    fig.add_trace(go.Scatter(
-        x=golden_crosses,
-        y=gc_y.values,
-        mode="markers",
-        marker=dict(color="#00cc88", size=11, symbol="triangle-up"),
-        name="GC",
-        hovertemplate="%{x|%Y/%m/%d}<br>ゴールデンクロス<extra></extra>",
-    ), row=1, col=1)
-
-# Dead cross markers
-if len(dead_crosses) > 0:
-    dc_y = ma_short.loc[dead_crosses]
-    fig.add_trace(go.Scatter(
-        x=dead_crosses,
-        y=dc_y.values,
-        mode="markers",
-        marker=dict(color="#ff3c3c", size=11, symbol="triangle-down"),
-        name="DC",
-        hovertemplate="%{x|%Y/%m/%d}<br>デッドクロス<extra></extra>",
-    ), row=1, col=1)
-
-# Current price line (main chart only)
-fig.add_hline(
-    y=current_price,
-    line_dash="dot",
-    line_color="rgba(255,255,255,0.3)",
-    annotation_text=f"現在 {current_price:,.0f}",
-    annotation_position="bottom right",
-    annotation_font_color="rgba(255,255,255,0.6)",
-    row=1, col=1,
-)
-
-# RSI
-rsi_clean = rsi.dropna()
-if len(rsi_clean) > 0:
-    fig.add_trace(go.Scatter(
-        x=rsi_clean.index,
-        y=rsi_clean.values,
-        mode="lines",
-        name="RSI(14)",
-        line=dict(color="#74b9ff", width=1.5),
-        hovertemplate="%{x|%Y/%m/%d}<br>RSI: %{y:.1f}<extra></extra>",
-    ), row=2, col=1)
-
-    # Overbought / oversold zones
-    fig.add_hrect(y0=70, y1=100, fillcolor="rgba(255,60,60,0.08)", line_width=0, row=2, col=1)
-    fig.add_hrect(y0=0, y1=30, fillcolor="rgba(0,200,136,0.08)", line_width=0, row=2, col=1)
-    fig.add_hline(y=70, line_dash="dash", line_color="rgba(255,60,60,0.55)", row=2, col=1,
-                  annotation_text="70", annotation_position="right",
-                  annotation_font_color="rgba(255,60,60,0.8)", annotation_font_size=10)
-    fig.add_hline(y=30, line_dash="dash", line_color="rgba(0,200,136,0.55)", row=2, col=1,
-                  annotation_text="30", annotation_position="right",
-                  annotation_font_color="rgba(0,200,136,0.8)", annotation_font_size=10)
-
-fig.update_layout(
-    template="plotly_dark",
-    paper_bgcolor="rgba(0,0,0,0)",
-    plot_bgcolor="rgba(26,31,46,0.8)",
-    margin=dict(l=0, r=0, t=10, b=10),
-    height=400,
-    showlegend=True,
-    legend=dict(
-        orientation="h",
-        yanchor="bottom",
-        y=1.01,
-        xanchor="right",
-        x=1,
-        font=dict(size=10),
-        bgcolor="rgba(0,0,0,0)",
-    ),
-    xaxis=dict(showgrid=False, zeroline=False),
-    yaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.05)", zeroline=False),
-    xaxis2=dict(showgrid=False, zeroline=False),
-    yaxis2=dict(
-        showgrid=True,
-        gridcolor="rgba(255,255,255,0.05)",
-        zeroline=False,
-        range=[0, 100],
-        tickvals=[0, 30, 50, 70, 100],
-    ),
-    hovermode="x unified",
-)
-
-fig.update_yaxes(title_text="RSI", title_font_size=10, row=2, col=1)
-
-st.plotly_chart(fig, use_container_width=True)
-
-cur_date_str = current_date.strftime("%Y/%m/%d") if hasattr(current_date, "strftime") else str(current_date)
-
-if watch_mode:
-    # ── Watch mode: info only, no judgment ───────────
-    st.info("👀 ウォッチ専用銘柄です。ディップ判定（買い増し目安）は表示しません。")
-
-    with st.expander("詳細", expanded=True):
-        rows = [
-            ("現在値", f"{current_price:,.2f}　({cur_date_str})"),
-            ("前日比", f"{today_sign}{today_change_pct:.2f}%"),
-            ("表示期間", f"過去{period_months}ヶ月"),
-        ]
-        rows_html = "\n".join(
-            f"<tr><td>{label}</td><td>{value}</td></tr>" for label, value in rows
-        )
         st.markdown(
-            f'<table class="info-table"><tbody>{rows_html}</tbody></table>',
+            f"""
+            <div class="decline-block" style="background:{decline_bg}; border: 1.5px solid {decline_color}55;">
+                <div class="decline-pct" style="color:{decline_color};">{decline_str}</div>
+                <div class="decline-label" style="color:{decline_color}; opacity:0.95; font-weight:600;">{decline_caption}</div>
+                {today_html}
+            </div>
+            """,
             unsafe_allow_html=True,
         )
-else:
-    # ── Funds input ──────────────────────────────────
-    st.markdown("#### 待機資金")
-    if "waiting_funds" not in st.session_state:
-        st.session_state.waiting_funds = 1_000_000
 
-    waiting_funds = st.number_input(
-        "合計額（円）",
-        min_value=0,
-        value=st.session_state.waiting_funds,
-        step=100_000,
-        format="%d",
-        key="waiting_funds",
+    # ── Technical indicators ──────────────────────────────
+    ma_short = close.rolling(25).mean()
+    ma_long = close.rolling(75).mean()
+    rsi = compute_rsi(close)
+
+    # Golden / dead cross detection
+    combined_ma = pd.DataFrame({"s": ma_short, "l": ma_long}).dropna()
+    if len(combined_ma) >= 2:
+        diff = combined_ma["s"] - combined_ma["l"]
+        sign_prev = diff.shift(1)
+        golden_crosses = diff.index[(sign_prev < 0) & (diff >= 0)]
+        dead_crosses = diff.index[(sign_prev > 0) & (diff <= 0)]
+    else:
+        golden_crosses = pd.DatetimeIndex([])
+        dead_crosses = pd.DatetimeIndex([])
+
+    # ── Chart ─────────────────────────────────────────────
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        row_heights=[0.68, 0.32],
+        vertical_spacing=0.06,
     )
 
-    # ── Judgment ─────────────────────────────────────
-    judgment = get_judgment(decline_pct if is_below_high else 0, waiting_funds)
+    # Price
+    fig.add_trace(go.Scatter(
+        x=close.index,
+        y=close.values,
+        mode="lines",
+        name="終値",
+        line=dict(color="#5b9cf6", width=2),
+        hovertemplate="%{x|%Y/%m/%d}<br>%{y:,.0f}<extra></extra>",
+    ), row=1, col=1)
 
-    amount_html = ""
-    if judgment["amount"] > 0:
-        amount_html = f'<div class="judgment-amount">¥{judgment["amount"]:,.0f}</div>'
+    # High marker (dip mode only)
+    if not watch_mode:
+        fig.add_trace(go.Scatter(
+            x=[recent_high_date],
+            y=[recent_high],
+            mode="markers+text",
+            marker=dict(color="#ffb400", size=10, symbol="triangle-up"),
+            text=[f"  高値 {recent_high:,.0f}"],
+            textposition="top right",
+            textfont=dict(color="#ffb400", size=11),
+            name="直近高値",
+            hovertemplate="%{x|%Y/%m/%d}<br>%{y:,.0f}<extra>直近高値</extra>",
+        ), row=1, col=1)
 
-    st.markdown(
-        f"""
-        <div class="judgment-block" style="background:{judgment['bg']}; border: 1.5px solid {judgment['border']}44;">
-            <div class="judgment-text">{judgment['level']}</div>
-            <div style="opacity:0.75; font-size:0.9rem; margin-top:0.4rem;">{judgment['detail']}</div>
-            {amount_html}
-        </div>
-        """,
-        unsafe_allow_html=True,
+    # MA25
+    if ma_short.dropna().shape[0] > 0:
+        ma25_clean = ma_short.dropna()
+        fig.add_trace(go.Scatter(
+            x=ma25_clean.index,
+            y=ma25_clean.values,
+            mode="lines",
+            name="MA25",
+            line=dict(color="#ff9f43", width=1.5, dash="solid"),
+            hovertemplate="%{x|%Y/%m/%d}<br>MA25: %{y:,.0f}<extra></extra>",
+        ), row=1, col=1)
+
+    # MA75
+    if ma_long.dropna().shape[0] > 0:
+        ma75_clean = ma_long.dropna()
+        fig.add_trace(go.Scatter(
+            x=ma75_clean.index,
+            y=ma75_clean.values,
+            mode="lines",
+            name="MA75",
+            line=dict(color="#a29bfe", width=1.5, dash="solid"),
+            hovertemplate="%{x|%Y/%m/%d}<br>MA75: %{y:,.0f}<extra></extra>",
+        ), row=1, col=1)
+
+    # Golden cross markers
+    if len(golden_crosses) > 0:
+        gc_y = ma_short.loc[golden_crosses]
+        fig.add_trace(go.Scatter(
+            x=golden_crosses,
+            y=gc_y.values,
+            mode="markers",
+            marker=dict(color="#00cc88", size=11, symbol="triangle-up"),
+            name="GC",
+            hovertemplate="%{x|%Y/%m/%d}<br>ゴールデンクロス<extra></extra>",
+        ), row=1, col=1)
+
+    # Dead cross markers
+    if len(dead_crosses) > 0:
+        dc_y = ma_short.loc[dead_crosses]
+        fig.add_trace(go.Scatter(
+            x=dead_crosses,
+            y=dc_y.values,
+            mode="markers",
+            marker=dict(color="#ff3c3c", size=11, symbol="triangle-down"),
+            name="DC",
+            hovertemplate="%{x|%Y/%m/%d}<br>デッドクロス<extra></extra>",
+        ), row=1, col=1)
+
+    # Current price line (main chart only)
+    fig.add_hline(
+        y=current_price,
+        line_dash="dot",
+        line_color="rgba(255,255,255,0.3)",
+        annotation_text=f"現在 {current_price:,.0f}",
+        annotation_position="bottom right",
+        annotation_font_color="rgba(255,255,255,0.6)",
+        row=1, col=1,
     )
 
-    # ── Data summary ─────────────────────────────────
-    with st.expander("判定の根拠", expanded=True):
-        high_date_str = recent_high_date.strftime("%Y/%m/%d") if hasattr(recent_high_date, "strftime") else str(recent_high_date)
-        rows = [
-            ("直近高値", f"{recent_high:,.0f}　({high_date_str})"),
-            ("現在値", f"{current_price:,.0f}　({cur_date_str})"),
-            ("下落率", f"{decline_pct:.2f}%" if is_below_high else "高値圏（下落なし）"),
-            ("前日比", f"{today_sign}{today_change_pct:.2f}%"),
-            ("測定期間", f"過去{period_months}ヶ月"),
-            ("待機資金", f"¥{waiting_funds:,.0f}"),
-        ]
-        rows_html = "\n".join(
-            f"<tr><td>{label}</td><td>{value}</td></tr>" for label, value in rows
+    # RSI
+    rsi_clean = rsi.dropna()
+    if len(rsi_clean) > 0:
+        fig.add_trace(go.Scatter(
+            x=rsi_clean.index,
+            y=rsi_clean.values,
+            mode="lines",
+            name="RSI(14)",
+            line=dict(color="#74b9ff", width=1.5),
+            hovertemplate="%{x|%Y/%m/%d}<br>RSI: %{y:.1f}<extra></extra>",
+        ), row=2, col=1)
+
+        # Overbought / oversold zones
+        fig.add_hrect(y0=70, y1=100, fillcolor="rgba(255,60,60,0.08)", line_width=0, row=2, col=1)
+        fig.add_hrect(y0=0, y1=30, fillcolor="rgba(0,200,136,0.08)", line_width=0, row=2, col=1)
+        fig.add_hline(y=70, line_dash="dash", line_color="rgba(255,60,60,0.55)", row=2, col=1,
+                      annotation_text="70", annotation_position="right",
+                      annotation_font_color="rgba(255,60,60,0.8)", annotation_font_size=10)
+        fig.add_hline(y=30, line_dash="dash", line_color="rgba(0,200,136,0.55)", row=2, col=1,
+                      annotation_text="30", annotation_position="right",
+                      annotation_font_color="rgba(0,200,136,0.8)", annotation_font_size=10)
+
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(26,31,46,0.8)",
+        margin=dict(l=0, r=0, t=10, b=10),
+        height=400,
+        showlegend=True,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.01,
+            xanchor="right",
+            x=1,
+            font=dict(size=10),
+            bgcolor="rgba(0,0,0,0)",
+        ),
+        xaxis=dict(showgrid=False, zeroline=False),
+        yaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.05)", zeroline=False),
+        xaxis2=dict(showgrid=False, zeroline=False),
+        yaxis2=dict(
+            showgrid=True,
+            gridcolor="rgba(255,255,255,0.05)",
+            zeroline=False,
+            range=[0, 100],
+            tickvals=[0, 30, 50, 70, 100],
+        ),
+        hovermode="x unified",
+    )
+
+    fig.update_yaxes(title_text="RSI", title_font_size=10, row=2, col=1)
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    cur_date_str = current_date.strftime("%Y/%m/%d") if hasattr(current_date, "strftime") else str(current_date)
+
+    if watch_mode:
+        # ── Watch mode: info only, no judgment ───────────
+        st.info("👀 ウォッチ専用銘柄です。ディップ判定（買い増し目安）は表示しません。")
+
+        with st.expander("詳細", expanded=True):
+            rows = [
+                ("現在値", f"{current_price:,.2f}　({cur_date_str})"),
+                ("前日比", f"{today_sign}{today_change_pct:.2f}%"),
+                ("表示期間", f"過去{period_months}ヶ月"),
+            ]
+            rows_html = "\n".join(
+                f"<tr><td>{label}</td><td>{value}</td></tr>" for label, value in rows
+            )
+            st.markdown(
+                f'<table class="info-table"><tbody>{rows_html}</tbody></table>',
+                unsafe_allow_html=True,
+            )
+    else:
+        # ── Funds input ──────────────────────────────────
+        st.markdown("#### 待機資金")
+        if "waiting_funds" not in st.session_state:
+            st.session_state.waiting_funds = 1_000_000
+
+        waiting_funds = st.number_input(
+            "合計額（円）",
+            min_value=0,
+            value=st.session_state.waiting_funds,
+            step=100_000,
+            format="%d",
+            key="waiting_funds",
         )
+
+        # ── Judgment ─────────────────────────────────────
+        judgment = get_judgment(decline_pct if is_below_high else 0, waiting_funds)
+
+        amount_html = ""
+        if judgment["amount"] > 0:
+            amount_html = f'<div class="judgment-amount">¥{judgment["amount"]:,.0f}</div>'
+
         st.markdown(
-            f'<table class="info-table"><tbody>{rows_html}</tbody></table>',
+            f"""
+            <div class="judgment-block" style="background:{judgment['bg']}; border: 1.5px solid {judgment['border']}44;">
+                <div class="judgment-text">{judgment['level']}</div>
+                <div style="opacity:0.75; font-size:0.9rem; margin-top:0.4rem;">{judgment['detail']}</div>
+                {amount_html}
+            </div>
+            """,
             unsafe_allow_html=True,
         )
+
+        # ── Data summary ─────────────────────────────────
+        with st.expander("判定の根拠", expanded=True):
+            high_date_str = recent_high_date.strftime("%Y/%m/%d") if hasattr(recent_high_date, "strftime") else str(recent_high_date)
+            rows = [
+                ("直近高値", f"{recent_high:,.0f}　({high_date_str})"),
+                ("現在値", f"{current_price:,.0f}　({cur_date_str})"),
+                ("下落率", f"{decline_pct:.2f}%" if is_below_high else "高値圏（下落なし）"),
+                ("前日比", f"{today_sign}{today_change_pct:.2f}%"),
+                ("測定期間", f"過去{period_months}ヶ月"),
+                ("待機資金", f"¥{waiting_funds:,.0f}"),
+            ]
+            rows_html = "\n".join(
+                f"<tr><td>{label}</td><td>{value}</td></tr>" for label, value in rows
+            )
+            st.markdown(
+                f'<table class="info-table"><tbody>{rows_html}</tbody></table>',
+                unsafe_allow_html=True,
+            )
+
+
+# ════════════════════════════════════════════════════
+# TAB 2 — Sector comparison (new)
+# ════════════════════════════════════════════════════
+with tab2:
+    period_label = st.radio(
+        "騰落率の期間",
+        list(SECTOR_PERIODS.keys()),
+        index=1,  # 1ヶ月がデフォルト
+        horizontal=True,
+        key="sector_period",
+    )
+    period_days = SECTOR_PERIODS[period_label]
+
+    with st.spinner("セクターデータ取得中..."):
+        returns: dict[str, float] = {}
+        skipped: list[str] = []
+        for etf, name in SECTORS.items():
+            ret = fetch_sector_return(etf, period_days)
+            if ret is None:
+                skipped.append(etf)
+            else:
+                returns[f"{etf}  {name}"] = ret
+
+    if skipped:
+        st.caption(f"データ取得不可のためスキップ: {', '.join(skipped)}")
+
+    if not returns:
+        st.warning("セクターデータを取得できませんでした。しばらく待ってから再試行してください。")
+    else:
+        # Sort ascending so highest return is at the top of a horizontal bar chart
+        sorted_items = sorted(returns.items(), key=lambda x: x[1])
+        labels = [item[0] for item in sorted_items]
+        values = [item[1] for item in sorted_items]
+        colors = ["#00cc88" if v >= 0 else "#ff3c3c" for v in values]
+
+        fig_sector = go.Figure(go.Bar(
+            x=values,
+            y=labels,
+            orientation="h",
+            marker_color=colors,
+            text=[f"{v:+.1f}%" for v in values],
+            textposition="outside",
+            cliponaxis=False,
+            hovertemplate="%{y}<br>%{x:+.2f}%<extra></extra>",
+        ))
+
+        x_abs_max = max(abs(v) for v in values) if values else 1
+        x_padding = x_abs_max * 0.25  # room for outside text labels
+
+        fig_sector.update_layout(
+            template="plotly_dark",
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(26,31,46,0.8)",
+            margin=dict(l=10, r=10, t=10, b=10),
+            height=max(280, len(labels) * 44),
+            showlegend=False,
+            xaxis=dict(
+                showgrid=True,
+                gridcolor="rgba(255,255,255,0.05)",
+                zeroline=True,
+                zerolinecolor="rgba(255,255,255,0.25)",
+                ticksuffix="%",
+                range=[-(x_abs_max + x_padding), x_abs_max + x_padding],
+            ),
+            yaxis=dict(showgrid=False, tickfont=dict(size=12)),
+        )
+
+        st.plotly_chart(fig_sector, use_container_width=True)
+
+        st.caption(f"期間: 直近{period_label} の騰落率（強い順）")
