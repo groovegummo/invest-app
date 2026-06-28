@@ -186,6 +186,56 @@ def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
+def market_mood(returns: dict, period_label: str) -> dict:
+    """Rule-based market mood from sector ETF returns. Returns display dict."""
+    OFFENSIVE = {"SOXX", "XLK", "XLY"}
+    DEFENSIVE = {"XLP", "XLV"}
+    overheat_th = {"1週間": 5.0, "1ヶ月": 15.0, "3ヶ月": 25.0, "6ヶ月": 40.0}.get(period_label, 15.0)
+
+    def ticker_of(label: str) -> str:
+        return label.split()[0]
+
+    values = list(returns.values())
+    total = len(values)
+    pos_count = sum(1 for v in values if v > 0)
+    neg_count = sum(1 for v in values if v < 0)
+
+    sorted_desc = sorted(returns.items(), key=lambda x: x[1], reverse=True)
+    top_ticker = ticker_of(sorted_desc[0][0]) if sorted_desc else ""
+    top_name = SECTORS.get(top_ticker, top_ticker)
+    top_value = sorted_desc[0][1] if sorted_desc else 0.0
+
+    top3_tickers = [ticker_of(label) for label, _ in sorted_desc[:3]]
+    off_in_top3 = sum(1 for t in top3_tickers if t in OFFENSIVE)
+    def_in_top3 = sum(1 for t in top3_tickers if t in DEFENSIVE)
+
+    # Determine mood tier
+    if neg_count == total:
+        icon, bg, border = "🔴", "rgba(255,60,60,0.09)", "#ff3c3c"
+        text = "全セクターがマイナス圏で、地合いは全面安の傾向です。"
+    elif neg_count >= total * 0.6:
+        icon, bg, border = "🟠", "rgba(255,140,0,0.09)", "#ff8c00"
+        text = "マイナスのセクターが多く、全体的に地合いが軟化している傾向です。"
+    elif def_in_top3 >= 2:
+        icon, bg, border = "🟡", "rgba(255,204,51,0.09)", "#ffcc33"
+        text = "生活必需品・ヘルスケアなど守りのセクターが上位の傾向で、資金が安全圏に向かいやすい地合いです。"
+    elif off_in_top3 >= 2 and pos_count >= total * 0.5:
+        icon, bg, border = "🟢", "rgba(0,200,136,0.09)", "#00cc88"
+        text = "半導体・テクノロジーなど攻めのセクターが上位の傾向で、リスクオン（強気）のムードが感じられます。"
+    elif pos_count >= total * 0.6:
+        icon, bg, border = "🔵", "rgba(91,156,246,0.09)", "#5b9cf6"
+        text = "プラスのセクターが過半数で、全体としてやや強い地合いの傾向です。"
+    else:
+        icon, bg, border = "⚪", "rgba(255,255,255,0.04)", "rgba(255,255,255,0.2)"
+        text = "強弱が混在しており、セクターによって方向感が分かれる地合いの傾向です。"
+
+    # Append overheat note when the top sector is notably elevated
+    if top_value >= overheat_th:
+        text += f"　なお{top_name}が{top_value:+.1f}%と突出した動きで、過熱感には注意が必要かもしれません。"
+
+    return {"icon": icon, "text": text, "bg": bg, "border": border}
+
+
 def get_judgment(decline_pct: float, funds: float) -> dict:
     if decline_pct >= 20:
         return {
@@ -623,6 +673,18 @@ with tab2:
         labels = [item[0] for item in sorted_items]
         values = [item[1] for item in sorted_items]
         colors = ["#00cc88" if v >= 0 else "#ff3c3c" for v in values]
+
+        mood = market_mood(returns, period_label)
+        st.markdown(
+            f"""
+            <div style="padding:0.85rem 1.1rem; border-radius:12px;
+                        background:{mood['bg']}; border:1.5px solid {mood['border']}55;
+                        margin-bottom:0.5rem; font-size:0.92rem; line-height:1.65;">
+                <span style="font-size:1.05rem;">{mood['icon']}</span>&nbsp;{mood['text']}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
         fig_sector = go.Figure(go.Bar(
             x=values,
