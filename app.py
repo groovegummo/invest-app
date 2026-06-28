@@ -108,9 +108,6 @@ SECTORS = {
 
 SECTOR_PERIODS = {"1週間": 7, "1ヶ月": 30, "3ヶ月": 90, "6ヶ月": 180}
 
-# ETF proxies for news (index tickers have sparse news on yfinance)
-NEWS_TICKER_MAP = {"^GSPC": "SPY", "^NDX": "QQQ"}
-
 
 @st.cache_data(ttl=300)
 def fetch_data(ticker: str, months: int) -> pd.DataFrame:
@@ -176,16 +173,6 @@ def fetch_sector_return(ticker: str, period_days: int) -> float | None:
     except Exception:
         return None
 
-
-@st.cache_data(ttl=1800)
-def fetch_news(ticker: str) -> list:
-    """Latest news items from yfinance. Empty list on failure."""
-    try:
-        news_ticker = NEWS_TICKER_MAP.get(ticker, ticker)
-        items = yf.Ticker(news_ticker).news or []
-        return items
-    except Exception:
-        return []
 
 
 def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
@@ -741,27 +728,6 @@ with tab1:
                 unsafe_allow_html=True,
             )
 
-    # ── News ─────────────────────────────────────────────
-    st.markdown("#### 関連ニュース")
-    news_items = fetch_news(ticker)
-    if not news_items:
-        st.caption("ニュースを取得できませんでした。")
-    else:
-        for item in news_items[:5]:
-            title = item.get("title", "")
-            link = item.get("link", "")
-            publisher = item.get("publisher", "")
-            ts = item.get("providerPublishTime", 0)
-            pub_time = datetime.fromtimestamp(ts).strftime("%m/%d %H:%M") if ts else ""
-            meta = f"{publisher}　{pub_time}".strip()
-            if link:
-                st.markdown(
-                    f"- [{title}]({link})"
-                    + (f"  \n  <span style='font-size:0.8rem;opacity:0.5;'>{meta}</span>" if meta else ""),
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.markdown(f"- {title}")
 
 
 # ════════════════════════════════════════════════════
