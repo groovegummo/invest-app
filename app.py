@@ -264,6 +264,53 @@ def train_ai_model() -> dict | None:
         return None
 
 
+def classify_phase(
+    rsi_now: float | None,
+    is_golden: bool,
+    days_since_gc: int | None,
+    days_since_dc: int | None,
+    near_yearly_low: bool,
+    rsi_cooling: bool,
+    decline_pct: float,
+) -> dict | None:
+    """
+    Rule-based 6-phase market classifier.
+    Priority order: 過熱 → 底値圏 → 過熱後の調整 → 反転初動 → 上昇トレンド → 下落トレンド
+    Returns None when RSI is unavailable (insufficient data).
+    """
+    if rsi_now is None:
+        return None
+
+    # 🔥 過熱: golden cross + RSI overbought
+    if is_golden and rsi_now >= 70:
+        return {"icon": "🔥", "name": "過熱",
+                "desc": "上昇の勢いが強すぎる局面。高値掴みに注意"}
+
+    # 🩹 底値圏: within 3% of 1-year low + RSI beaten down
+    if near_yearly_low and rsi_now <= 38:
+        return {"icon": "🩹", "name": "底値圏",
+                "desc": "下落が一段落の可能性。反転シグナルに注目"}
+
+    # 😮‍💨 過熱後の調整: was overheated, RSI now cooling, still in golden cross
+    if rsi_cooling and is_golden and decline_pct >= 3:
+        return {"icon": "😮‍💨", "name": "過熱後の調整",
+                "desc": "上昇の勢いが一服。押し目を狙うなら監視を"}
+
+    # 🌱 反転初動: golden cross turned recently (within ~40 trading days)
+    if is_golden and days_since_gc is not None and days_since_gc <= 40:
+        return {"icon": "🌱", "name": "反転初動",
+                "desc": "トレンド転換の初期局面。本物かダマシかはまだ不明"}
+
+    # 🚀 上昇トレンド: sustained golden cross, moderate RSI
+    if is_golden:
+        return {"icon": "🚀", "name": "上昇トレンド",
+                "desc": "トレンドに沿った買い場を探せる局面"}
+
+    # ⚠️ 下落トレンド: dead cross, price below MAs
+    return {"icon": "⚠️", "name": "下落トレンド",
+            "desc": "下落圧力継続。底打ちの確認まで慎重に"}
+
+
 def compute_composite(
     decline_pct: float,
     is_below_high: bool,
@@ -654,6 +701,45 @@ with tab1:
                 else:
                     combo_html = ""
 
+                # ── Phase features ────────────────────────────
+                _today = close.index[-1]
+                _days_since_gc = (
+                    int((_today - golden_crosses[-1]).days)
+                    if len(golden_crosses) > 0 else None
+                )
+                _days_since_dc = (
+                    int((_today - dead_crosses[-1]).days)
+                    if len(dead_crosses) > 0 else None
+                )
+                _rolling_low_1y = close.rolling(252, min_periods=50).min()
+                _lw = min(20, len(close))
+                _near_yearly_low = bool(
+                    (close.iloc[-_lw:] <= _rolling_low_1y.iloc[-_lw:] * 1.03).any()
+                ) if _rolling_low_1y.dropna().shape[0] > 0 else False
+                _rsi_win     = rsi_clean.iloc[-30:] if len(rsi_clean) >= 30 else rsi_clean
+                _rsi_cooling = bool(
+                    len(_rsi_win) > 1
+                    and bool((_rsi_win.iloc[:-1] > 70).any())
+                    and float(_rsi_win.iloc[-1]) < 65
+                )
+
+                # ── Phase classification ──────────────────────
+                _is_golden_now = _cross_known and (ma25_last > ma75_last)
+                phase = classify_phase(
+                    rsi_now=rsi_last,
+                    is_golden=_is_golden_now,
+                    days_since_gc=_days_since_gc,
+                    days_since_dc=_days_since_dc,
+                    near_yearly_low=_near_yearly_low,
+                    rsi_cooling=_rsi_cooling,
+                    decline_pct=decline_pct if is_below_high else 0.0,
+                )
+                phase_html = (
+                    f'<div style="font-size:0.82rem; margin-top:0.3rem; line-height:1.5;">'
+                    f'📍 現在の局面：<strong>{phase["icon"]} {phase["name"]}</strong>'
+                    f'<br><span style="font-size:0.77rem; opacity:0.6;">{phase["desc"]}</span></div>'
+                ) if phase else ""
+
                 st.markdown(
                     f"""
                     <div style="padding:0.8rem 1.1rem; border-radius:12px;
@@ -665,6 +751,7 @@ with tab1:
                             <span style="font-size:0.9rem; opacity:0.75;">確信度 {confidence*100:.0f}%</span>
                         </div>
                         {combo_html}
+                        {phase_html}
                         <div style="font-size:0.75rem; opacity:0.42; margin-top:0.35rem; line-height:1.5;">
                             テスト正答率 {ai_bundle['test_acc']*100:.0f}%（{ai_bundle['n_test']}日分で検証）　※参考情報です。投資判断の根拠にしないでください。
                         </div>
