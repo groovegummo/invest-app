@@ -185,6 +185,85 @@ def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
+@st.cache_data(ttl=86400)
+def train_ai_model() -> dict | None:
+    """
+    Train LogisticRegression on 5Y of NDX to predict 20-day forward returns.
+    Returns a model bundle dict, or None on failure.
+    Time-based 80/20 split; last 20 trading days excluded to prevent data leakage.
+    """
+    try:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.metrics import accuracy_score
+
+        end = datetime.now()
+        start = end - timedelta(days=5 * 365 + 60)
+        df = yf.download("^NDX", start=start, end=end, progress=False, auto_adjust=True)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        if df.empty or "Close" not in df.columns:
+            return None
+
+        close = df["Close"].squeeze().dropna()
+        if len(close) < 300:
+            return None
+
+        # ── Feature engineering (mirrors app's live calculations) ──
+        rolling_high = close.rolling(252, min_periods=50).max()
+        decline      = ((rolling_high - close) / rolling_high * 100).clip(lower=0)
+
+        ma25     = close.rolling(25).mean()
+        ma75     = close.rolling(75).mean()
+        ma25_dev = (close - ma25) / ma25 * 100
+        ma75_dev = (close - ma75) / ma75 * 100
+        ma_trend = (ma25 > ma75).astype(float)
+
+        delta    = close.diff()
+        avg_gain = delta.clip(lower=0).ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+        avg_loss = (-delta).clip(lower=0).ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+        rs       = avg_gain / avg_loss.replace(0, float("inf"))
+        rsi_s    = 100 - (100 / (1 + rs))
+
+        # ── Labels: 20-day forward return ──────────────
+        fwd_ret = close.shift(-20) / close - 1
+        label   = (fwd_ret > 0).astype(int)
+
+        feat_cols = ["decline", "ma25_dev", "ma75_dev", "ma_trend", "rsi"]
+        data = pd.DataFrame({
+            "decline": decline, "ma25_dev": ma25_dev, "ma75_dev": ma75_dev,
+            "ma_trend": ma_trend, "rsi": rsi_s, "label": label,
+        }).dropna()
+
+        # Exclude last 20 trading days — future return is not yet observable
+        data = data.iloc[:-20]
+        if len(data) < 150:
+            return None
+
+        # ── Chronological 80 / 20 split ────────────────
+        split    = int(len(data) * 0.8)
+        X_train  = data.iloc[:split][feat_cols].values
+        y_train  = data.iloc[:split]["label"].values
+        X_test   = data.iloc[split:][feat_cols].values
+        y_test   = data.iloc[split:]["label"].values
+
+        scaler     = StandardScaler()
+        X_train_s  = scaler.fit_transform(X_train)
+        X_test_s   = scaler.transform(X_test)
+
+        model = LogisticRegression(max_iter=1000, random_state=42)
+        model.fit(X_train_s, y_train)
+
+        test_acc = accuracy_score(y_test, model.predict(X_test_s))
+        return {
+            "model": model, "scaler": scaler,
+            "test_acc": test_acc, "feat_cols": feat_cols,
+            "n_train": len(X_train), "n_test": len(X_test),
+        }
+    except Exception:
+        return None
+
+
 def compute_composite(
     decline_pct: float,
     is_below_high: bool,
@@ -482,6 +561,7 @@ with tab1:
     ma_long = close.rolling(75).mean()
     rsi = compute_rsi(close)
 
+    rsi_clean = rsi.dropna()
     combined_ma = pd.DataFrame({"s": ma_short, "l": ma_long}).dropna()
     if len(combined_ma) >= 2:
         diff = combined_ma["s"] - combined_ma["l"]
@@ -526,6 +606,53 @@ with tab1:
             """,
             unsafe_allow_html=True,
         )
+
+        # ── AI judgment ──────────────────────────────────────
+        ai_bundle = train_ai_model()
+        if ai_bundle is not None:
+            ma25_last = (float(ma_short.dropna().iloc[-1])
+                         if ma_short.dropna().shape[0] > 0 else None)
+            ma75_last = (float(ma_long.dropna().iloc[-1])
+                         if ma_long.dropna().shape[0] > 0 else None)
+            rsi_last  = (float(rsi_clean.iloc[-1])
+                         if len(rsi_clean) > 0 else None)
+
+            if all(v is not None for v in [ma25_last, ma75_last, rsi_last]):
+                x_now = pd.DataFrame([[
+                    decline_pct if is_below_high else 0.0,
+                    (current_price - ma25_last) / ma25_last * 100,
+                    (current_price - ma75_last) / ma75_last * 100,
+                    1.0 if ma25_last > ma75_last else 0.0,
+                    rsi_last,
+                ]], columns=ai_bundle["feat_cols"])
+
+                x_scaled   = ai_bundle["scaler"].transform(x_now.values)
+                pred       = int(ai_bundle["model"].predict(x_scaled)[0])
+                proba      = ai_bundle["model"].predict_proba(x_scaled)[0]
+                confidence = float(proba[pred])
+
+                ai_label = "強気" if pred == 1 else "弱気"
+                ai_icon  = "📈"   if pred == 1 else "📉"
+                ai_color = "#00cc88" if pred == 1 else "#ff3c3c"
+                ai_bg    = "rgba(0,200,136,0.07)" if pred == 1 else "rgba(255,60,60,0.07)"
+
+                st.markdown(
+                    f"""
+                    <div style="padding:0.8rem 1.1rem; border-radius:12px;
+                                background:{ai_bg}; border:1.5px solid {ai_color}44;
+                                margin-bottom:0.5rem;">
+                        <div style="display:flex; align-items:center; gap:0.6rem; flex-wrap:wrap;">
+                            <span style="font-size:0.82rem; opacity:0.6;">🤖 AI地合い判定</span>
+                            <span style="font-size:1.1rem; font-weight:700; color:{ai_color};">{ai_icon} {ai_label}</span>
+                            <span style="font-size:0.9rem; opacity:0.75;">確信度 {confidence*100:.0f}%</span>
+                        </div>
+                        <div style="font-size:0.75rem; opacity:0.42; margin-top:0.35rem; line-height:1.5;">
+                            テスト正答率 {ai_bundle['test_acc']*100:.0f}%（{ai_bundle['n_test']}日分で検証）　※参考情報です。投資判断の根拠にしないでください。
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
     # ── Decline / watch display ──────────────────────────
     if watch_mode:
