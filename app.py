@@ -636,6 +636,24 @@ with tab1:
                 ai_color = "#00cc88" if pred == 1 else "#ff3c3c"
                 ai_bg    = "rgba(0,200,136,0.07)" if pred == 1 else "rgba(255,60,60,0.07)"
 
+                # 4-pattern comment: AI sentiment × MA cross state
+                _cross_known = (ma25_last is not None and ma75_last is not None)
+                if _cross_known:
+                    _golden = ma25_last > ma75_last
+                    _combo_map = {
+                        (1, True):  "🚀 順張り良好。トレンドに乗れている",
+                        (1, False): "🤔 強気だが足元は調整中。様子見も一手",
+                        (0, True):  "⚡ 反転の初動かも。底打ちの可能性。逆張り妙味",
+                        (0, False): "⚠️ 下落トレンド継続。落ちるナイフに注意。慎重に",
+                    }
+                    combo_comment = _combo_map[(pred, _golden)]
+                    combo_html = (
+                        f'<div style="font-size:0.85rem; margin-top:0.3rem;">'
+                        f"{combo_comment}</div>"
+                    )
+                else:
+                    combo_html = ""
+
                 st.markdown(
                     f"""
                     <div style="padding:0.8rem 1.1rem; border-radius:12px;
@@ -646,6 +664,7 @@ with tab1:
                             <span style="font-size:1.1rem; font-weight:700; color:{ai_color};">{ai_icon} {ai_label}</span>
                             <span style="font-size:0.9rem; opacity:0.75;">確信度 {confidence*100:.0f}%</span>
                         </div>
+                        {combo_html}
                         <div style="font-size:0.75rem; opacity:0.42; margin-top:0.35rem; line-height:1.5;">
                             テスト正答率 {ai_bundle['test_acc']*100:.0f}%（{ai_bundle['n_test']}日分で検証）　※参考情報です。投資判断の根拠にしないでください。
                         </div>
