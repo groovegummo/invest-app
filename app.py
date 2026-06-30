@@ -632,6 +632,18 @@ with tab1:
         filled = "█" * sc["total"]
         empty = "░" * (10 - sc["total"])
         d_str = f"{decline_pct:.1f}%" if is_below_high else "高値圏"
+
+        trend_up  = len(combined_ma) >= 1 and combined_ma["s"].iloc[-1] > combined_ma["l"].iloc[-1]
+        dip_score = sc["d_score"]
+        if trend_up and dip_score <= 1:
+            comb_verdict = "📈 トレンドは強いが押し目が浅い → 静観"
+        elif trend_up and dip_score >= 4:
+            comb_verdict = "🎯 上昇トレンド中の押し目 → 買い場候補"
+        elif not trend_up and dip_score >= 4:
+            comb_verdict = "⚠️ 下落トレンド中の急落 → 落ちるナイフ注意"
+        else:
+            comb_verdict = "🤔 シグナル弱め → 様子見"
+
         st.markdown(
             f"""
             <div style="padding:1.1rem 1.3rem; border-radius:14px;
@@ -648,6 +660,10 @@ with tab1:
                     ▼ 下落率 {d_str} &nbsp;→&nbsp; {sc['d_score']}/5<br>
                     ↗ クロス {sc['c_label']} &nbsp;→&nbsp; {sc['c_score']}/3<br>
                     🌐 地合い {sc['s_label']} &nbsp;→&nbsp; {sc['s_score']}/2
+                </div>
+                <div style="font-size:0.87rem; margin-top:0.55rem; padding-top:0.5rem;
+                            border-top:1px solid {sc['color']}30;">
+                    {comb_verdict}
                 </div>
             </div>
             """,
